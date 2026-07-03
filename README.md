@@ -4,7 +4,7 @@ A Diablo 1-inspired action RPG with a black metal theme. TypeScript, Vite,
 and raw Canvas 2D — no game engine, no art assets; everything is drawn and
 synthesized procedurally.
 
-**Play it:** https://denturion.github.io/Svartfrost/
+**Play it:** [https://svartfrost.vercel.app/]
 
 ## Features
 
