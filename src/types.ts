@@ -5,7 +5,7 @@ export interface Point {
   y: number;
 }
 
-export type EnemyKind = 'wretch' | 'draugr' | 'boss';
+export type EnemyKind = 'wretch' | 'draugr' | 'boss' | 'volva' | 'ratling' | 'brute';
 
 export interface Entity {
   x: number; // float tile coords
@@ -32,8 +32,16 @@ export interface Enemy extends Entity {
   aggro: boolean;
   repathTimer: number;
   slowT: number; // frost-slow seconds remaining
+  bleedT: number; // blood-magic bleed seconds remaining
+  bleedTick: number; // seconds until the next bleed tick
+  windupT: number; // brute: seconds left before its telegraphed slam lands
+  hazardCd: number; // boss: seconds until it can cast another ground hazard
   xpValue: number;
   bossId?: number; // index into the boss roster, for name and look
+  // A stronger "unique" variant of a normal wretch/draugr — Diablo 1 style.
+  // tint colors the whole body; seed keeps its spike layout stable frame to
+  // frame instead of jittering.
+  rare?: { tint: string; seed: number };
 }
 
 export interface Player extends Entity {
@@ -74,7 +82,7 @@ export interface GroundItem {
 }
 
 export interface Effect {
-  kind: 'nova' | 'levelup' | 'boom' | 'bolt';
+  kind: 'nova' | 'levelup' | 'boom' | 'bolt' | 'drain';
   x: number;
   y: number;
   r: number; // world radius in tiles at t = 1
@@ -84,10 +92,27 @@ export interface Effect {
   y2?: number;
 }
 
+// A lingering ground hazard (Plague Bloom, or a boss's answer to it) — ticks
+// damage to anyone standing in it every `tickEvery` seconds until `ttl`
+// runs out. `hostile` flips who it hurts: unset/false damages enemies
+// (the player's own spell), true damages the player (a boss's).
+export interface Hazard {
+  x: number;
+  y: number;
+  r: number;
+  ttl: number;
+  maxTtl: number;
+  tickT: number;
+  tickEvery: number;
+  hostile?: boolean;
+}
+
 export interface Projectile {
   x: number;
   y: number;
   vx: number; // tiles per second
   vy: number;
   ttl: number;
+  hostile?: boolean; // a Völva's bolt: hits the player, not enemies
+  dmg?: number;
 }

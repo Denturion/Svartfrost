@@ -2,12 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>SVARTFROST</title>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23050507'/%3E%3Cpath d='M16 4 28 16 16 28 4 16Z' fill='none' stroke='%23c9ced6' stroke-width='2'/%3E%3C/svg%3E"
     />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/icon-180.png" />
+    <meta name="theme-color" content="#050507" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Svartfrost" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -22,14 +32,61 @@
         overflow: hidden;
         background: #000;
         cursor: crosshair;
+        overscroll-behavior: none;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-touch-callout: none;
       }
       canvas {
         display: block;
+        touch-action: none;
+      }
+      #rotate-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        background: #050507;
+        color: #c9ced6;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        font-family: 'Cinzel', Georgia, serif;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      #rotate-overlay .glyph {
+        font-size: 48px;
+        margin-bottom: 18px;
+        color: #8b9099;
+      }
+      #rotate-overlay p {
+        margin: 6px 0;
+      }
+      #rotate-overlay .sub {
+        font-family: Georgia, serif;
+        font-size: 14px;
+        color: #8b9099;
+      }
+      /* Only touch devices in portrait — a narrow desktop window shouldn't
+         be blocked, only phones/tablets held the "wrong" way. */
+      @media (pointer: coarse) and (orientation: portrait) {
+        #rotate-overlay {
+          display: flex;
+        }
       }
     </style>
   </head>
   <body>
     <canvas id="game"></canvas>
+    <div id="rotate-overlay">
+      <div>
+        <div class="glyph">&#8635;</div>
+        <p>Turn your device sideways</p>
+        <p class="sub">Svartfrost is played in landscape</p>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

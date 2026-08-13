@@ -1,0 +1,15 @@
+{
+  "name": "SVARTFROST",
+  "short_name": "Svartfrost",
+  "description": "A Diablo 1-inspired action RPG with a black metal theme.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#050507",
+  "theme_color": "#050507",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

@@ -10,14 +10,17 @@ import type { Records, RunSave } from './save';
 import { sfx, setMusicDepth } from './sound';
 import { SPELLS } from './spells';
 import type { SpellId } from './spells';
-import { INV, invPanelRect, titleMenu } from './ui';
+import { hudLayout, invMetrics, invPanelRect, titleMenu } from './ui';
+import { isTouchDevice } from './device';
 import type {
   Corpse,
   DamageNumber,
   Effect,
   Enemy,
+  EnemyKind,
   Entity,
   GroundItem,
+  Hazard,
   Player,
   Point,
   Projectile,
@@ -25,7 +28,7 @@ import type {
 
 const ATTACK_RANGE = 1.5;
 const NOVA_RADIUS = 3.5;
-const POTION_HEAL = 30;
+export const POTION_HEAL = 30;
 const BELT_SIZE = 8;
 
 const BOSS_NAMES = [
@@ -41,6 +44,27 @@ const BOSS_NAMES = [
   'Dissection, the Star-Reaper',
 ];
 
+// Rare "unique" wretches and draugr — Diablo 1-style elite packs. Tint is an
+// 'r,g,b' triplet the renderer multiplies over the body.
+const RARE_AFFIXES: { name: string; tint: string }[] = [
+  { name: 'Bloodfang', tint: '200,40,45' },
+  { name: 'Frostmarrow', tint: '140,210,235' },
+  { name: 'Ashenclaw', tint: '235,140,60' },
+  { name: 'Nightgaunt', tint: '160,90,210' },
+  { name: 'Wormrot', tint: '130,190,90' },
+  { name: 'Graveheld', tint: '215,210,195' },
+];
+const RARE_CHANCE = 0.08;
+
+// Weighted per-spawn roll, gated by depth so newer runs meet the melee
+// staples first before ranged/heavy threats start showing up.
+function pickEnemyKind(rand: () => number, depth: number): EnemyKind {
+  const roll = rand();
+  if (depth >= 4 && roll < 0.1) return 'brute';
+  if (depth >= 2 && roll < 0.28) return 'volva';
+  return roll < 0.75 ? 'wretch' : 'draugr';
+}
+
 export class Game {
   dungeon!: Dungeon;
   player!: Player;
@@ -49,6 +73,7 @@ export class Game {
   groundItems: GroundItem[] = [];
   effects: Effect[] = [];
   projectiles: Projectile[] = [];
+  hazards: Hazard[] = [];
   dmgNums: DamageNumber[] = [];
   depth = 1;
   kills = 0;
@@ -58,6 +83,9 @@ export class Game {
   records: Records;
   savedRun: RunSave | null;
   invOpen = false;
+  // Touch has no right-click to cast with, so tapping the mana orb "arms"
+  // the spell — the next tap on the field casts there instead of moving.
+  spellArmed = false;
   showFps = false;
   hurtFlash = 0;
   banner = { text: '', sub: '', t: 0 };
@@ -165,7 +193,7 @@ export class Game {
     this.depth = depth;
     setMusicDepth(depth);
     const rand = this.depthRng(depth);
-    this.dungeon = generateDungeon(rand);
+    this.dungeon = generateDungeon(rand, depth);
     const { start } = this.dungeon;
     if (fresh) {
       this.player = createPlayer(start.x, start.y);
@@ -186,6 +214,7 @@ export class Game {
     this.groundItems = [];
     this.effects = [];
     this.projectiles = [];
+    this.hazards = [];
     this.dmgNums = [];
     this.spawnEnemies(depth, rand);
   }
@@ -202,8 +231,29 @@ export class Game {
       if (!isWalkable(this.dungeon, x, y)) continue;
       if (x === this.dungeon.stairs.x && y === this.dungeon.stairs.y) continue;
       if (this.enemies.some((e) => Math.round(e.x) === x && Math.round(e.y) === y)) continue;
-      const kind = rand() < 0.7 ? 'wretch' : 'draugr';
-      this.enemies.push(createEnemy(kind, x, y, depth));
+
+      // A ratling pack, spawned together in place of a lone monster.
+      if (depth >= 2 && rand() < 0.1) {
+        const packSize = 3 + ((rand() * 3) | 0);
+        for (let i = 0; i < packSize && this.enemies.length < count; i++) {
+          const ox = x + (((rand() * 3) | 0) - 1);
+          const oy = y + (((rand() * 3) | 0) - 1);
+          if (!isWalkable(this.dungeon, ox, oy)) continue;
+          if (this.enemies.some((e) => Math.round(e.x) === ox && Math.round(e.y) === oy)) continue;
+          this.enemies.push(createEnemy('ratling', ox, oy, depth));
+        }
+        continue;
+      }
+
+      const kind = pickEnemyKind(rand, depth);
+      // Rares stay out of the first couple of depths — let a new run learn
+      // the basics before an elite can ambush it — and only ever roll on
+      // the two base kinds the affix/stat table was tuned around.
+      const rareAffix =
+        depth >= 3 && (kind === 'wretch' || kind === 'draugr') && rand() < RARE_CHANCE
+          ? RARE_AFFIXES[(rand() * RARE_AFFIXES.length) | 0]
+          : undefined;
+      this.enemies.push(createEnemy(kind, x, y, depth, undefined, undefined, rareAffix));
     }
 
     // Every fifth depth, a named horror guards the stairs.
@@ -228,22 +278,53 @@ export class Game {
 
   // --- input intents ---------------------------------------------------
 
-  /** Returns true if the click landed on UI and should not reach the world. */
-  uiClick(mx: number, my: number, viewW: number): boolean {
-    if (!this.invOpen) return false;
-    const rect = invPanelRect(viewW, this.player.inventory.length);
-    if (mx < rect.x || mx > rect.x + rect.w || my < rect.y || my > rect.y + rect.h) return false;
-    const row = Math.floor((my - rect.y - INV.headerH) / INV.rowH);
-    if (row >= 0 && row < this.player.inventory.length) this.equipFromInventory(row);
-    return true;
+  /** Returns true if the click/tap landed on UI and should not reach the world. */
+  uiClick(mx: number, my: number, viewW: number, viewH: number): boolean {
+    if (this.invOpen) {
+      const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
+      if (mx >= rect.x && mx <= rect.x + rect.w && my >= rect.y && my <= rect.y + rect.h) {
+        const m = invMetrics(viewW, viewH);
+        const row = Math.floor((my - rect.y - m.headerH) / m.rowH);
+        if (row >= 0 && row < this.player.inventory.length) this.equipFromInventory(row);
+        return true;
+      }
+    }
+    if (this.screen === 'playing') {
+      const layout = hudLayout(viewW, viewH);
+      // Satchel / pause icon buttons — touch only, desktop already has I/Esc.
+      if (isTouchDevice) {
+        if (Math.hypot(mx - layout.satchelBtn.x, my - layout.satchelBtn.y) < layout.satchelBtn.r) {
+          this.invOpen = !this.invOpen;
+          return true;
+        }
+        if (Math.hypot(mx - layout.pauseBtn.x, my - layout.pauseBtn.y) < layout.pauseBtn.r) {
+          this.togglePause();
+          return true;
+        }
+      }
+      // Tap the potion belt to drink; tap the mana orb to arm the spell for
+      // the next tap on the field — both work for mouse too, not just touch.
+      if (!this.invOpen) {
+        if (Math.hypot(mx - layout.potion.x, my - layout.potion.y) < layout.potion.r) {
+          this.drinkPotion();
+          return true;
+        }
+        if (Math.hypot(mx - layout.manaCx, my - layout.orbY) < layout.bezelR) {
+          this.spellArmed = !this.spellArmed;
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /** Right-clicks on the satchel drop the row's item; returns true if consumed. */
-  uiRightClick(mx: number, my: number, viewW: number): boolean {
+  uiRightClick(mx: number, my: number, viewW: number, viewH: number): boolean {
     if (!this.invOpen) return false;
-    const rect = invPanelRect(viewW, this.player.inventory.length);
+    const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
     if (mx < rect.x || mx > rect.x + rect.w || my < rect.y || my > rect.y + rect.h) return false;
-    const row = Math.floor((my - rect.y - INV.headerH) / INV.rowH);
+    const m = invMetrics(viewW, viewH);
+    const row = Math.floor((my - rect.y - m.headerH) / m.rowH);
     if (row >= 0 && row < this.player.inventory.length) this.dropFromInventory(row);
     return true;
   }
@@ -453,6 +534,46 @@ export class Game {
         }
         break;
       }
+      case 'blight':
+        this.hazards.push({ x: tileX, y: tileY, r: 2.2, ttl: 4.5, maxTtl: 4.5, tickT: 0, tickEvery: 0.5 });
+        sfx.blight();
+        break;
+      case 'blood': {
+        // Rides the aim ray to the first enemy it crosses, same reach as
+        // Lightning, but single-target: a burst hit, a life-drain heal, and
+        // a few seconds of bleed ticks after.
+        let ex = p.x;
+        let ey = p.y;
+        for (let s = 0; s < 24; s++) {
+          const nx = ex + dx * 0.25;
+          const ny = ey + dy * 0.25;
+          if (!isWalkable(this.dungeon, Math.round(nx), Math.round(ny))) break;
+          ex = nx;
+          ey = ny;
+        }
+        let target: Enemy | null = null;
+        let bestT = Infinity;
+        for (const e of this.enemies) {
+          if (segmentDist(p.x, p.y, ex, ey, e.x, e.y) > 0.8) continue;
+          const t = (e.x - p.x) * dx + (e.y - p.y) * dy;
+          if (t >= 0 && t < bestT) {
+            bestT = t;
+            target = e;
+          }
+        }
+        this.effects.push({ kind: 'drain', x: p.x, y: p.y, x2: target?.x ?? ex, y2: target?.y ?? ey, r: 0, t: 0 });
+        sfx.bloodrite();
+        if (target) {
+          const dmg = 10 + ((Math.random() * 8) | 0) + p.level;
+          this.damageEnemy(target, dmg, '#e8555f', true);
+          const heal = Math.round(dmg * 0.45);
+          p.hp = Math.min(p.maxHp, p.hp + heal);
+          this.dmgNums.push({ x: p.x, y: p.y, value: `+${heal}`, t: 1, color: '#e8555f' });
+          target.bleedT = 3.5;
+          target.bleedTick = 0.5;
+        }
+        break;
+      }
     }
   }
 
@@ -507,10 +628,48 @@ export class Game {
       pr.y += pr.vy * dt;
       pr.ttl -= dt;
       const hitWall = !isWalkable(this.dungeon, Math.round(pr.x), Math.round(pr.y));
+      if (pr.hostile) {
+        const hitPlayer = Math.hypot(this.player.x - pr.x, this.player.y - pr.y) <= 0.6;
+        if (hitWall || hitPlayer || pr.ttl <= 0) {
+          if (hitPlayer) this.damagePlayer(pr.dmg ?? 4);
+          this.effects.push({ kind: 'boom', x: pr.x, y: pr.y, r: 1.1, t: 0, color: '110,180,220' });
+          return false;
+        }
+        return true;
+      }
       const hitEnemy = this.enemies.some((e) => e.hp > 0 && Math.hypot(e.x - pr.x, e.y - pr.y) <= 0.7);
       if (hitWall || hitEnemy || pr.ttl <= 0) {
         this.explodeFireball(pr.x, pr.y);
         return false;
+      }
+      return true;
+    });
+
+    // Plague Bloom hazards — tick damage (and a slow) to anyone standing
+    // inside, until they expire. A boss's hazard is `hostile`: it hurts the
+    // player instead of enemies.
+    this.hazards = this.hazards.filter((hz) => {
+      hz.ttl -= dt;
+      if (hz.ttl <= 0) return false;
+      hz.tickT -= dt;
+      if (hz.tickT <= 0) {
+        hz.tickT = hz.tickEvery;
+        if (hz.hostile) {
+          if (Math.hypot(this.player.x - hz.x, this.player.y - hz.y) <= hz.r) {
+            this.damagePlayer(3 + ((Math.random() * 3) | 0));
+            sfx.blightTick();
+          }
+        } else {
+          let hitSomething = false;
+          for (const e of [...this.enemies]) {
+            if (Math.hypot(e.x - hz.x, e.y - hz.y) <= hz.r) {
+              e.slowT = Math.max(e.slowT, 0.6);
+              this.damageEnemy(e, 3 + ((Math.random() * 3) | 0) + Math.floor(this.player.level / 2), '#a8c97a', true);
+              hitSomething = true;
+            }
+          }
+          if (hitSomething) sfx.blightTick();
+        }
       }
       return true;
     });
@@ -557,6 +716,13 @@ export class Game {
           p.lungeDY = (target.y - p.y) / len;
           sfx.swing();
           this.damageEnemy(target, rollDamage(p));
+          if (p.weapon.lifeOnHit) {
+            p.hp = Math.min(p.maxHp, p.hp + p.weapon.lifeOnHit);
+          }
+          if (p.weapon.bleedChance && Math.random() < p.weapon.bleedChance && target.hp > 0) {
+            target.bleedT = 3;
+            target.bleedTick = Math.min(target.bleedTick || 0.5, 0.5);
+          }
         }
       } else if (this.playerRepath <= 0) {
         this.playerRepath = 0.35;
@@ -616,6 +782,14 @@ export class Game {
     e.lunge = Math.max(0, e.lunge - dt * 4);
     e.flash = Math.max(0, e.flash - dt);
     e.slowT = Math.max(0, e.slowT - dt);
+    if (e.bleedT > 0) {
+      e.bleedT -= dt;
+      e.bleedTick -= dt;
+      if (e.bleedTick <= 0) {
+        e.bleedTick = 0.5;
+        this.damageEnemy(e, 2 + ((Math.random() * 3) | 0), '#e8555f', true);
+      }
+    }
     e.repathTimer -= dt;
     const slowMul = e.slowT > 0 ? 0.35 : 1;
 
@@ -626,7 +800,83 @@ export class Game {
     }
     if (!e.aggro) return;
 
+    if (e.kind === 'boss') this.updateBossPowers(e, dt, dist);
+    if (e.kind === 'volva') {
+      this.updateVolva(e, dt, dist, slowMul);
+      return;
+    }
+    if (e.kind === 'brute') {
+      this.updateBrute(e, dt, dist, slowMul);
+      return;
+    }
+
+    // Enrage: below 30% hp a boss hits faster and harder, with a visual
+    // tell (see drawEnemy) instead of a silent stat bump.
+    const enraged = e.kind === 'boss' && e.hp / e.maxHp <= 0.3;
     if (dist <= ATTACK_RANGE * 0.93) {
+      e.path = [];
+      if (e.attackTimer <= 0) {
+        e.attackTimer = (e.attackCd / slowMul) * (enraged ? 0.7 : 1);
+        e.lunge = 1;
+        const len = Math.max(0.001, dist);
+        e.lungeDX = (p.x - e.x) / len;
+        e.lungeDY = (p.y - e.y) / len;
+        this.damagePlayer(Math.round(rollDamage(e) * (enraged ? 1.3 : 1)));
+      }
+    } else {
+      this.chaseTowardPlayer(e);
+    }
+
+    const moveMul = slowMul * (enraged ? 1.3 : 1);
+    if (this.followPath(e, dt * moveMul)) {
+      e.walkPhase += dt * moveMul * e.speed * 2.5;
+    }
+  }
+
+  /** Recomputes a path to the player if the repath cooldown allows —
+   * shared by every enemy kind that ends up chasing on foot. */
+  private chaseTowardPlayer(e: Enemy): void {
+    if (e.repathTimer > 0) return;
+    e.repathTimer = 0.5 + Math.random() * 0.3;
+    const p = this.player;
+    const blocked = new Set<number>();
+    for (const other of this.enemies) {
+      if (other !== e && other.hp > 0) {
+        blocked.add(Math.round(other.y) * this.dungeon.w + Math.round(other.x));
+      }
+    }
+    const path = findPath(
+      this.dungeon,
+      { x: Math.round(e.x), y: Math.round(e.y) },
+      { x: Math.round(p.x), y: Math.round(p.y) },
+      blocked,
+    );
+    if (path) e.path = path;
+  }
+
+  /** Völva: keeps its distance and lobs a hostile frost bolt when the
+   * player sits in its comfortable cast range. */
+  private updateVolva(e: Enemy, dt: number, dist: number, slowMul: number): void {
+    const p = this.player;
+    const KEEP_DIST = 3.5;
+    const CAST_RANGE = 6.5;
+    if (dist < KEEP_DIST) {
+      e.path = [];
+      if (e.repathTimer <= 0) {
+        e.repathTimer = 0.4;
+        const len = Math.max(0.001, dist);
+        const awayX = e.x + ((e.x - p.x) / len) * 3;
+        const awayY = e.y + ((e.y - p.y) / len) * 3;
+        const path = findPath(
+          this.dungeon,
+          { x: Math.round(e.x), y: Math.round(e.y) },
+          { x: Math.round(awayX), y: Math.round(awayY) },
+        );
+        if (path) e.path = path;
+      }
+    } else if (dist > CAST_RANGE) {
+      this.chaseTowardPlayer(e);
+    } else {
       e.path = [];
       if (e.attackTimer <= 0) {
         e.attackTimer = e.attackCd / slowMul;
@@ -634,27 +884,76 @@ export class Game {
         const len = Math.max(0.001, dist);
         e.lungeDX = (p.x - e.x) / len;
         e.lungeDY = (p.y - e.y) / len;
-        this.damagePlayer(rollDamage(e));
+        this.projectiles.push({
+          x: e.x,
+          y: e.y,
+          vx: e.lungeDX * 6,
+          vy: e.lungeDY * 6,
+          ttl: 2,
+          hostile: true,
+          dmg: rollDamage(e),
+        });
+        sfx.lightning();
       }
-    } else if (e.repathTimer <= 0) {
-      e.repathTimer = 0.5 + Math.random() * 0.3;
-      const blocked = new Set<number>();
-      for (const other of this.enemies) {
-        if (other !== e && other.hp > 0) {
-          blocked.add(Math.round(other.y) * this.dungeon.w + Math.round(other.x));
-        }
-      }
-      const path = findPath(
-        this.dungeon,
-        { x: Math.round(e.x), y: Math.round(e.y) },
-        { x: Math.round(p.x), y: Math.round(p.y) },
-        blocked,
-      );
-      if (path) e.path = path;
     }
-
     if (this.followPath(e, dt * slowMul)) {
       e.walkPhase += dt * slowMul * e.speed * 2.5;
+    }
+  }
+
+  /** Brute: telegraphs its slam with a windup the player can dodge out of,
+   * instead of an instant hit — the reward for spotting the tell. */
+  private updateBrute(e: Enemy, dt: number, dist: number, slowMul: number): void {
+    const p = this.player;
+    const SLAM_RANGE = 1.7;
+    if (e.windupT > 0) {
+      e.windupT -= dt;
+      e.path = [];
+      if (e.windupT <= 0) {
+        if (Math.hypot(p.x - e.x, p.y - e.y) <= SLAM_RANGE) {
+          this.damagePlayer(rollDamage(e));
+        }
+        this.effects.push({ kind: 'boom', x: e.x, y: e.y, r: SLAM_RANGE, t: 0, color: '190,60,50' });
+        sfx.fireboom();
+        e.attackTimer = e.attackCd / slowMul;
+      }
+      return;
+    }
+    if (dist <= SLAM_RANGE * 1.05) {
+      e.path = [];
+      if (e.attackTimer <= 0) {
+        e.windupT = 0.7;
+        e.lunge = 0.5;
+        const len = Math.max(0.001, dist);
+        e.lungeDX = (p.x - e.x) / len;
+        e.lungeDY = (p.y - e.y) / len;
+      }
+    } else {
+      this.chaseTowardPlayer(e);
+    }
+    if (this.followPath(e, dt * slowMul)) {
+      e.walkPhase += dt * slowMul * e.speed * 2.5;
+    }
+  }
+
+  /** Boss-only: an occasional hostile Plague-Bloom-style pool at the
+   * player's feet, on top of its normal melee behavior. */
+  private updateBossPowers(e: Enemy, dt: number, dist: number): void {
+    e.hazardCd = Math.max(0, e.hazardCd - dt);
+    if (e.hazardCd <= 0 && dist < 9) {
+      e.hazardCd = 5 + Math.random() * 2.5;
+      const p = this.player;
+      this.hazards.push({
+        x: Math.round(p.x),
+        y: Math.round(p.y),
+        r: 1.7,
+        ttl: 3.5,
+        maxTtl: 3.5,
+        tickT: 0,
+        tickEvery: 0.5,
+        hostile: true,
+      });
+      sfx.blight();
     }
   }
 
@@ -688,7 +987,7 @@ export class Game {
       this.corpses.push({ x: Math.round(e.x), y: Math.round(e.y), kind: e.kind, seed: Math.random() });
       if (this.targetEnemy === e) this.targetEnemy = null;
       if (this.hoverEnemy === e) this.hoverEnemy = null;
-      for (const loot of rollDrops(this.depth, e.kind === 'boss')) {
+      for (const loot of rollDrops(this.depth, e.kind === 'boss' || !!e.rare)) {
         this.groundItems.push({
           x: Math.round(e.x) + (Math.random() - 0.5) * 0.7,
           y: Math.round(e.y) + (Math.random() - 0.5) * 0.7,
@@ -697,6 +996,7 @@ export class Game {
       }
       this.gainXp(e.xpValue);
       sfx.enemyDie();
+      if (e.rare) this.banner = { text: e.name, sub: 'a rare foe falls', t: 2.4 };
     }
   }
 

@@ -33,6 +33,9 @@ export interface Dungeon {
   // Wall tiles that touch a floor tile — the only ones worth drawing.
   facing: boolean[];
   torches: Torch[];
+  // Deep levels can be entirely frost-clad, instead of scattering icy walls
+  // tile-by-tile — a whole-dungeon look, not a per-tile roll.
+  frostLevel: boolean;
 }
 
 function roomCenter(r: Room): Point {
@@ -48,7 +51,7 @@ function overlaps(a: Room, b: Room): boolean {
   );
 }
 
-export function generateDungeon(rand: () => number = Math.random): Dungeon {
+export function generateDungeon(rand: () => number = Math.random, depth = 1): Dungeon {
   const w = MAP_W;
   const h = MAP_H;
   const tiles = new Array<Tile>(w * h).fill(Tile.Wall);
@@ -153,6 +156,10 @@ export function generateDungeon(rand: () => number = Math.random): Dungeon {
     }
   }
 
+  // Uses depth alone (not `rand`), so it never perturbs the room-layout
+  // stream above — deterministic per depth, independent of layout variety.
+  const frostLevel = depth >= 5 && tileHash(depth * 97 + 11, depth * 131 + 7) > 0.55;
+
   return {
     w,
     h,
@@ -163,6 +170,7 @@ export function generateDungeon(rand: () => number = Math.random): Dungeon {
     explored: new Array<boolean>(w * h).fill(false),
     facing,
     torches,
+    frostLevel,
   };
 }
 

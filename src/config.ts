@@ -2,6 +2,11 @@ export const TILE_W = 64;
 export const TILE_H = 32;
 export const WALL_H = 46;
 
+// Camera zoom: scales the whole world view (tiles, walls, entities, effects)
+// about the screen center, independent of tile geometry. Input math mirrors
+// this via screenToWorldTile() so clicks still land on the right tile.
+export const ZOOM = 1.4;
+
 export const MAP_W = 52;
 export const MAP_H = 52;
 
@@ -23,9 +28,12 @@ export const PALETTE = {
 
 /** Scale a base color by brightness; `warm` shifts it toward torchlight amber. */
 export function shade(rgb: readonly [number, number, number], b: number, warm = 0): string {
-  const r = rgb[0] * b * (1 + 0.5 * warm);
-  const g = rgb[1] * b * (1 + 0.2 * warm);
-  const bl = rgb[2] * b * (1 - 0.18 * warm);
+  // Crush the low end so shadow reads as near-black stone rather than a
+  // smooth grey gradient — closer to Diablo 1's hard-lit, dithered look.
+  const bc = b <= 0 ? 0 : Math.pow(b, 1.35);
+  const r = rgb[0] * bc * (1 + 0.5 * warm);
+  const g = rgb[1] * bc * (1 + 0.2 * warm);
+  const bl = rgb[2] * bc * (1 - 0.18 * warm);
   return `rgb(${r | 0},${g | 0},${bl | 0})`;
 }
 

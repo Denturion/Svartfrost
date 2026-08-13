@@ -3,12 +3,13 @@
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
 let muted = false;
+let volume = 0.7;
 
 export function initAudio(): void {
   if (ctx) return;
   ctx = new AudioContext();
   master = ctx.createGain();
-  master.gain.value = 0.7;
+  master.gain.value = muted ? 0 : volume;
   master.connect(ctx.destination);
   startDrone();
 }
@@ -16,9 +17,21 @@ export function initAudio(): void {
 export function toggleMute(): boolean {
   muted = !muted;
   if (master && ctx) {
-    master.gain.setTargetAtTime(muted ? 0 : 0.7, ctx.currentTime, 0.05);
+    master.gain.setTargetAtTime(muted ? 0 : volume, ctx.currentTime, 0.05);
   }
   return muted;
+}
+
+export function getVolume(): number {
+  return volume;
+}
+
+/** Also un-mutes, since dragging the level back up is an unambiguous
+ * "I want sound" — matches how a hardware volume knob behaves. */
+export function setVolume(v: number): void {
+  volume = Math.max(0, Math.min(1, v));
+  muted = false;
+  if (master && ctx) master.gain.setTargetAtTime(volume, ctx.currentTime, 0.05);
 }
 
 // --- ambient moods ----------------------------------------------------------
@@ -234,6 +247,15 @@ export const sfx = {
   lightning: () => {
     noiseBurst(0.12, 3500, 0.2, 'highpass');
     thud(150, 0.15, 0.18);
+  },
+  blight: () => {
+    noiseBurst(0.5, 220, 0.16, 'lowpass');
+    sweep(90, 55, 0.6, 0.1, 'sawtooth');
+  },
+  blightTick: () => noiseBurst(0.08, 260, 0.06, 'lowpass'),
+  bloodrite: () => {
+    noiseBurst(0.18, 600, 0.14, 'bandpass');
+    thud(160, 0.3, 0.22);
   },
   potion: () => {
     thud(300, 0.12, 0.1);

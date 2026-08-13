@@ -6,6 +6,7 @@ import {
   TILE_H,
   TILE_W,
   WALL_H,
+  ZOOM,
   roman,
   shade,
   tileHash,
@@ -13,10 +14,23 @@ import {
 import { Tile } from './dungeon';
 import type { Dungeon } from './dungeon';
 import type { Game } from './game';
-import { describeItem } from './items';
-import type { Loot } from './items';
+import { POTION_HEAL } from './game';
+import {
+  floorImg,
+  playerClothImg,
+  playerSkinImg,
+  playerSteelImg,
+  playerTexturesReady,
+  texturesReady,
+  wallFrostImg,
+  wallStoneImg,
+} from './textures';
+import { describeItem, itemStatLine } from './items';
+import type { Item, Loot } from './items';
 import { isoX, isoY, screenToTile } from './iso';
-import { INV, invPanelRect, titleMenu } from './ui';
+import { hudLayout, hudScale, invMetrics, invPanelRect, pauseVolumeLayout, titleMenu } from './ui';
+import { isTouchDevice } from './device';
+import { getVolume } from './sound';
 import { SPELLS } from './spells';
 import { xpNext } from './entities';
 import type { Enemy, Player } from './types';
@@ -43,6 +57,21 @@ export function getCamOffset(game: Game, w: number, h: number): { offX: number; 
   };
 }
 
+/** Inverts the render loop's zoom-about-center transform, so screen-space
+ * mouse coordinates land on the same tile the player sees under the cursor. */
+export function screenToWorldTile(
+  mouseX: number,
+  mouseY: number,
+  offX: number,
+  offY: number,
+  w: number,
+  h: number,
+): { x: number; y: number } {
+  const wx = w / 2 + (mouseX - w / 2) / ZOOM;
+  const wy = h / 2 + (mouseY - h / 2) / ZOOM;
+  return screenToTile(wx - offX, wy - offY);
+}
+
 let flickNow = 1;
 let torchFlickNow = 1;
 /** Warmth (0 = cold player light, 1 = pure torchlight) of the last lightAt call. */
@@ -50,7 +79,9 @@ let outWarm = 0;
 
 function brightnessAt(game: Game, x: number, y: number): number {
   const d = Math.hypot(x - game.player.x, y - game.player.y);
-  const b = (1.25 - d / LIGHT_RADIUS) * flickNow;
+  const t = Math.max(0, 1.25 - d / LIGHT_RADIUS);
+  // Squared falloff: a harder pool edge instead of a smooth linear fade.
+  const b = t * t * flickNow;
   return Math.max(0, Math.min(1, b));
 }
 
@@ -64,7 +95,8 @@ function torchLight(d: Dungeon, x: number, y: number): number {
     if (dx > TORCH_RADIUS || dx < -TORCH_RADIUS) continue;
     const dy = y - t.ly;
     if (dy > TORCH_RADIUS || dy < -TORCH_RADIUS) continue;
-    const fall = (1 - Math.hypot(dx, dy) / TORCH_RADIUS) * TORCH_POWER;
+    const raw = Math.max(0, 1 - Math.hypot(dx, dy) / TORCH_RADIUS);
+    const fall = raw * raw * TORCH_POWER;
     if (fall > tb) tb = fall;
   }
   return Math.max(0, tb);
@@ -92,6 +124,151 @@ function diamond(ctx: CanvasRenderingContext2D, px: number, py: number, s = 1): 
   ctx.lineTo(px, py + HH + HH * s);
   ctx.lineTo(px - HW * s, py + HH);
   ctx.closePath();
+}
+
+// --- photo textures ---------------------------------------------------
+// AI-generated stone photography, affine-warped onto the current path's
+// destination triangle (p0 = source top-left, p1 = source top-right,
+// p2 = source bottom-left; the fourth corner is implied since the
+// destination is a true parallelogram). Caller clips to the real shape
+// first so a non-parallelogram quad still can't bleed past its edges.
+function drawWarpedImage(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  sx: number,
+  sy: number,
+  sw: number,
+  sh: number,
+  p0: [number, number],
+  p1: [number, number],
+  p2: [number, number],
+): void {
+  ctx.save();
+  ctx.transform((p1[0] - p0[0]) / sw, (p1[1] - p0[1]) / sw, (p2[0] - p0[0]) / sh, (p2[1] - p0[1]) / sh, p0[0], p0[1]);
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+  ctx.restore();
+}
+
+/** Multiply-tints whatever the current path covers to match torch/player light. */
+function tintPath(ctx: CanvasRenderingContext2D, b: number, warm: number): void {
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = shade([255, 255, 255], Math.min(1, b * 1.7), warm);
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/** A random sub-crop of `img`, avoiding the top/bottom ~10% (ornate border bands). */
+function pickWallCrop(img: HTMLImageElement, x: number, y: number, fi: number): [number, number, number, number] {
+  const sw = img.width * 0.22;
+  const sh = img.height * 0.32;
+  const bodyTop = img.height * 0.1;
+  const bodyH = img.height * 0.8 - sh;
+  const sx = tileHash(x * 13 + fi * 5 + 2, y * 7 + 9) * (img.width - sw);
+  const sy = bodyTop + tileHash(x * 5 + 3, y * 11 + fi * 7 + 4) * bodyH;
+  return [sx, sy, sw, sh];
+}
+
+function pickFloorCrop(img: HTMLImageElement, x: number, y: number): [number, number, number, number] {
+  const sw = img.width * 0.46;
+  const sh = img.height * 0.46;
+  const sx = tileHash(x * 9 + 2, y * 13 + 5) * (img.width - sw);
+  const sy = tileHash(x * 13 + 7, y * 9 + 3) * (img.height - sh);
+  return [sx, sy, sw, sh];
+}
+
+// --- baked per-tile texture cache -------------------------------------
+// The affine warp (clip + transform + drawImage) is the expensive part of
+// texturing a tile, but its result never changes for a given tile — only
+// the brightness tint on top does, every frame, as torches flicker. So the
+// warp is baked once into a small offscreen canvas per tile, and the hot
+// per-frame path is just a plain drawImage blit plus a cheap tint fill.
+const TEX_PAD = 16;
+let floorTexCache = new Map<string, HTMLCanvasElement>();
+let wallTexCache = new Map<string, HTMLCanvasElement>();
+
+function getFloorTexCanvas(x: number, y: number): HTMLCanvasElement {
+  const key = `${x},${y}`;
+  let c = floorTexCache.get(key);
+  if (c) return c;
+  c = document.createElement('canvas');
+  c.width = TILE_W + TEX_PAD * 2;
+  c.height = TILE_H + TEX_PAD * 2;
+  const cctx = c.getContext('2d')!;
+  const rpx = HW + TEX_PAD;
+  const rpy = TEX_PAD;
+  const [sx, sy, sw, sh] = pickFloorCrop(floorImg, x, y);
+  diamond(cctx, rpx, rpy);
+  cctx.save();
+  cctx.clip();
+  drawWarpedImage(cctx, floorImg, sx, sy, sw, sh, [rpx - HW, rpy + HH], [rpx, rpy], [rpx, rpy + TILE_H]);
+  cctx.restore();
+  floorTexCache.set(key, c);
+  return c;
+}
+
+function getWallTexCanvas(ws: WallStyle): HTMLCanvasElement {
+  const key = `${ws.x},${ws.y}`;
+  let c = wallTexCache.get(key);
+  if (c) return c;
+  const { hgt, jit } = ws;
+  c = document.createElement('canvas');
+  c.width = TILE_W + TEX_PAD * 2;
+  c.height = hgt + TILE_H + TEX_PAD * 2;
+  const cctx = c.getContext('2d')!;
+  const img = ws.frost ? wallFrostImg : wallStoneImg;
+  const rpx = HW + TEX_PAD;
+  const rpy = hgt + TEX_PAD;
+
+  const facesLocal: [number, number, number, number][] = [
+    [rpx - HW, rpy + HH, rpx, rpy + TILE_H],
+    [rpx, rpy + TILE_H, rpx + HW, rpy + HH],
+  ];
+  for (let fi = 0; fi < 2; fi++) {
+    const [b0x, b0y, b1x, b1y] = facesLocal[fi];
+    const topLeft = facePt(b0x, b0y, b1x, b1y, 0, 1, hgt);
+    const topRight = facePt(b0x, b0y, b1x, b1y, 1, 1, hgt);
+    const bottomLeft = facePt(b0x, b0y, b1x, b1y, 0, 0, hgt);
+    const p0 = facePt(b0x, b0y, b1x, b1y, 0, 0, hgt);
+    const p1 = facePt(b0x, b0y, b1x, b1y, 1, 0, hgt);
+    const p2 = facePt(b0x, b0y, b1x, b1y, 1, 1, hgt);
+    const p3 = facePt(b0x, b0y, b1x, b1y, 0, 1, hgt);
+    const [sx, sy, sw, sh] = pickWallCrop(img, ws.x, ws.y, fi);
+    cctx.beginPath();
+    cctx.moveTo(p0[0], p0[1]);
+    cctx.lineTo(p1[0], p1[1]);
+    cctx.lineTo(p2[0], p2[1]);
+    cctx.lineTo(p3[0], p3[1]);
+    cctx.closePath();
+    cctx.save();
+    cctx.clip();
+    drawWarpedImage(cctx, img, sx, sy, sw, sh, topLeft, topRight, bottomLeft);
+    cctx.restore();
+  }
+
+  // Top slab, using the same jitter the live draw uses.
+  const [jN, jE, jS, jW] = jit;
+  const nXl = rpx + jN[0];
+  const nYl = rpy - hgt + jN[1];
+  const eXl = rpx + HW + jE[0];
+  const eYl = rpy + HH - hgt + jE[1];
+  const sXl = rpx + jS[0];
+  const sYl = rpy + TILE_H - hgt + jS[1];
+  const wXl = rpx - HW + jW[0];
+  const wYl = rpy + HH - hgt + jW[1];
+  const [tsx, tsy, tsw, tsh] = pickWallCrop(img, ws.x, ws.y, 2);
+  cctx.beginPath();
+  cctx.moveTo(nXl, nYl);
+  cctx.lineTo(eXl, eYl);
+  cctx.lineTo(sXl, sYl);
+  cctx.lineTo(wXl, wYl);
+  cctx.closePath();
+  cctx.save();
+  cctx.clip();
+  drawWarpedImage(cctx, img, tsx, tsy, tsw, tsh, [wXl, wYl], [nXl, nYl], [sXl, sYl]);
+  cctx.restore();
+
+  wallTexCache.set(key, c);
+  return c;
 }
 
 // --- floors ----------------------------------------------------------------
@@ -125,10 +302,17 @@ function drawFloorTile(
   ao: number,
 ): void {
   const j = 0.82 + tileHash(x, y) * 0.36;
-  const base = (x + y) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
-  ctx.fillStyle = shade(base, b * j, warm);
-  diamond(ctx, px, py);
-  ctx.fill();
+  if (texturesReady()) {
+    const cached = getFloorTexCanvas(x, y);
+    ctx.drawImage(cached, px - HW - TEX_PAD, py - TEX_PAD);
+    diamond(ctx, px, py);
+    tintPath(ctx, b * j, warm);
+  } else {
+    const base = (x + y) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
+    ctx.fillStyle = shade(base, b * j, warm);
+    diamond(ctx, px, py);
+    ctx.fill();
+  }
 
   const cx = px;
   const cy = py + HH;
@@ -247,6 +431,8 @@ function drawFloorTile(
 // --- walls ----------------------------------------------------------------
 
 interface WallStyle {
+  x: number;
+  y: number;
   px: number;
   py: number;
   hgt: number;
@@ -312,6 +498,8 @@ function computeWallStyle(
   const seOpen = orthFloor(1, 0);
   const accFace: 0 | 1 = swOpen && seOpen ? (h1 < 0.5 ? 0 : 1) : swOpen ? 0 : 1;
   return {
+    x,
+    y,
     px,
     py,
     hgt: ruined ? WALL_H * (0.5 + h1 * 0.9) : WALL_H * (0.92 + h1 * 0.16),
@@ -320,7 +508,7 @@ function computeWallStyle(
     cut,
     pillar,
     ruined,
-    frost: !pillar && h1 > 0.78,
+    frost: !pillar && d.frostLevel,
     h1,
     torch,
     time,
@@ -414,6 +602,14 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
   ctx.closePath();
   ctx.fill();
 
+  // Photographed masonry for both faces and the top slab, baked once per
+  // tile (see getWallTexCanvas) and blitted as one image — cheap every
+  // frame; only the tint fills below need to re-run as light flickers.
+  if (texturesReady()) {
+    const cached = getWallTexCanvas(ws);
+    ctx.drawImage(cached, px - HW - TEX_PAD, py - hgt - TEX_PAD);
+  }
+
   const faces: [number, number, number, number][] = [
     [px - HW, py + HH, px, py + TILE_H], // SW: W corner -> S corner
     [px, py + TILE_H, px + HW, py + HH], // SE
@@ -463,6 +659,15 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
         }
       }
       ctx.stroke();
+    }
+  } else if (texturesReady()) {
+    // Photographed masonry, baked once per tile (see getWallTexCanvas — the
+    // blit itself happens once below, shared with the top slab) and
+    // multiply-tinted per frame by the same torch/player light the
+    // procedural fallback uses.
+    for (let fi = 0; fi < 2; fi++) {
+      faceQuad(fi, 0, 0, 1, 1);
+      tintPath(ctx, bj, warm);
     }
   } else {
     // Brick tones: alternate half-course quads catch different light.
@@ -570,15 +775,20 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
     ctx.stroke();
   }
 
-  // Top slab, jittered.
-  ctx.fillStyle = shade(PALETTE.wallTop, bj, warm);
+  // Top slab, jittered — textured (blitted with the faces above) instead
+  // of a flat fill, when ready.
   ctx.beginPath();
   ctx.moveTo(nX, nY);
   ctx.lineTo(eX, eY);
   ctx.lineTo(sX, sY);
   ctx.lineTo(wX, wY);
   ctx.closePath();
-  ctx.fill();
+  if (texturesReady()) {
+    tintPath(ctx, bj, warm);
+  } else {
+    ctx.fillStyle = shade(PALETTE.wallTop, bj, warm);
+    ctx.fill();
+  }
   // Split tone across the slab.
   ctx.fillStyle = 'rgba(0,0,0,0.07)';
   ctx.beginPath();
@@ -604,8 +814,9 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
     ctx.lineTo((eX + sX) / 2, (eY + sY) / 2);
     ctx.stroke();
   }
-  // Moon-pale rim on the upper edges.
-  ctx.strokeStyle = `rgba(180,195,210,${0.08 + bj * 0.14})`;
+  // Moon-pale rim on the upper edges — a faint icy edge lingers even where
+  // torch/player light doesn't reach, like distant moonlight through vents.
+  ctx.strokeStyle = `rgba(190,205,222,${0.13 + bj * 0.12})`;
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.moveTo(wX, wY);
@@ -740,7 +951,7 @@ function drawPillar(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
   ctx.fillStyle = shade(PALETTE.wallTop, bj, warm);
   diamond(ctx, px, cy - ph, s);
   ctx.fill();
-  ctx.strokeStyle = `rgba(180,195,210,${0.08 + bj * 0.14})`;
+  ctx.strokeStyle = `rgba(190,205,222,${0.13 + bj * 0.12})`;
   ctx.lineWidth = 1;
   diamond(ctx, px, cy - ph, s);
   ctx.stroke();
@@ -757,36 +968,55 @@ let staticFor: Dungeon | null = null;
 let staticOX = 0;
 let staticCount = -1;
 let staticBuiltAt = 0;
+// Tracks what's already painted onto staticCanvas, so newly explored tiles
+// are the only work each call — redrawing the whole explored map from
+// scratch every ~500ms was a multi-hundred-ms main-thread stall once a
+// level was mostly explored.
+let staticBaked: Uint8Array | null = null;
 
 function rebuildStatic(d: Dungeon): void {
   const c = staticCanvas!.getContext('2d')!;
-  c.clearRect(0, 0, staticCanvas!.width, staticCanvas!.height);
+  const baked = staticBaked!;
 
   for (let y = 0; y < d.h; y++) {
     for (let x = 0; x < d.w; x++) {
       const idx = y * d.w + x;
-      if (!d.explored[idx]) continue;
-      const tile = d.tiles[idx];
-      if (tile === Tile.Wall) continue;
+      if (!d.explored[idx] || baked[idx] || d.tiles[idx] === Tile.Wall) continue;
       const sb = staticLightAt(d, x, y);
-      drawFloorTile(c, staticOX + isoX(x, y), STATIC_OY + isoY(x, y), x, y, sb, outWarm, tile, null, aoMask(d, x, y));
+      drawFloorTile(
+        c,
+        staticOX + isoX(x, y),
+        STATIC_OY + isoY(x, y),
+        x,
+        y,
+        sb,
+        outWarm,
+        d.tiles[idx],
+        null,
+        aoMask(d, x, y),
+      );
     }
   }
 
-  const walls: { x: number; y: number }[] = [];
+  const newWalls: { x: number; y: number }[] = [];
   for (let y = 0; y < d.h; y++) {
     for (let x = 0; x < d.w; x++) {
       const idx = y * d.w + x;
-      if (d.explored[idx] && d.tiles[idx] === Tile.Wall && d.facing[idx]) walls.push({ x, y });
+      if (d.explored[idx] && !baked[idx] && d.tiles[idx] === Tile.Wall && d.facing[idx]) newWalls.push({ x, y });
     }
   }
-  walls.sort((a, b) => a.x + a.y - (b.x + b.y));
-  for (const { x, y } of walls) {
+  // Sorted so newly revealed walls still layer correctly among themselves;
+  // they paint on top of whatever's already baked, which holds up in
+  // practice since overlap only ever happens between screen-adjacent tiles.
+  newWalls.sort((a, b) => a.x + a.y - (b.x + b.y));
+  for (const { x, y } of newWalls) {
     const px = staticOX + isoX(x, y);
     const py = STATIC_OY + isoY(x, y);
     const sb = staticLightAt(d, x, y);
     drawWallBlock(c, computeWallStyle(d, x, y, px, py, sb, outWarm, 0, null));
   }
+
+  for (let i = 0; i < d.explored.length; i++) if (d.explored[i]) baked[i] = 1;
 }
 
 function ensureStatic(d: Dungeon): void {
@@ -797,6 +1027,11 @@ function ensureStatic(d: Dungeon): void {
     staticOX = d.h * HW;
     staticFor = d;
     staticCount = -1;
+    staticBaked = new Uint8Array(d.w * d.h);
+    // A new dungeon means new tile crops/frost-vs-stone choices at every
+    // (x, y) — last level's baked textures no longer apply.
+    floorTexCache = new Map();
+    wallTexCache = new Map();
   }
   let count = 0;
   const ex = d.explored;
@@ -858,7 +1093,8 @@ function getVignette(w: number, h: number): HTMLCanvasElement {
     const c = vigCanvas.getContext('2d')!;
     const vg = c.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.3, w / 2, h / 2, Math.max(w, h) * 0.72);
     vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(1, 'rgba(0,0,0,0.62)');
+    vg.addColorStop(0.7, 'rgba(3,5,9,0.32)');
+    vg.addColorStop(1, 'rgba(2,4,10,0.68)');
     c.fillStyle = vg;
     c.fillRect(0, 0, w, h);
   }
@@ -891,7 +1127,7 @@ function getGrainScreen(w: number, h: number): HTMLCanvasElement {
       img.data[i] = v;
       img.data[i + 1] = v;
       img.data[i + 2] = v;
-      img.data[i + 3] = 28;
+      img.data[i + 3] = 36;
     }
     tctx.putImageData(img, 0, 0);
     const gctx = grainScreen!.getContext('2d')!;
@@ -1027,6 +1263,29 @@ function drawShadow(ctx: CanvasRenderingContext2D, fx: number, fy: number, rx: n
   ctx.fill();
 }
 
+/** Jagged spikes ringing a rare enemy's silhouette — `seed` (0..1, fixed
+ * per instance) keeps the layout stable frame to frame instead of jittering. */
+function drawRareSpikes(ctx: CanvasRenderingContext2D, seed: number): void {
+  const n = 6;
+  ctx.fillStyle = '#14151a';
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2 + seed * Math.PI * 2;
+    const nx = Math.cos(a);
+    const ny = Math.sin(a) * 0.55; // squashed to roughly match the body's iso oval
+    const rx = nx * 9;
+    const ry = ny * 16 - 11;
+    const len = 5 + ((Math.sin(seed * 91 + i * 17) + 1) / 2) * 3.5;
+    const tx = -ny;
+    const ty = nx;
+    ctx.beginPath();
+    ctx.moveTo(rx - tx * 1.8, ry - ty * 1.8);
+    ctx.lineTo(rx + nx * len, ry + ny * len);
+    ctx.lineTo(rx + tx * 1.8, ry + ty * 1.8);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
 /** A soft radial gleam behind glowing eyes. */
 function eyeGlow(ctx: CanvasRenderingContext2D, x: number, y: number, rgb: string, r = 2.8): void {
   const g = ctx.createRadialGradient(x, y, 0.2, x, y, r);
@@ -1036,10 +1295,108 @@ function eyeGlow(ctx: CanvasRenderingContext2D, x: number, y: number, rgb: strin
   ctx.fillRect(x - r, y - r, r * 2, r * 2);
 }
 
+/** An inverted Latin cross — the crossbar sits low, not high — used in
+ * place of a neutral iron-cross glyph wherever the UI wants a menacing
+ * flourish (title menu, depth marker, satchel trim). */
+function drawInvertedCross(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number, alpha: number): void {
+  const barW = Math.max(1.5, s * 0.26);
+  const armLen = s * 0.62;
+  const armY = cy + s * 0.32;
+  ctx.fillStyle = `rgba(200,206,214,${alpha})`;
+  ctx.fillRect(cx - barW / 2, cy - s, barW, s * 2);
+  ctx.fillRect(cx - armLen, armY - barW / 2, armLen * 2, barW);
+}
+
+// --- player materials -------------------------------------------------
+// Small photo swatches (cloth, skin, steel) reused as repeating fill/stroke
+// patterns on the existing hand-animated silhouette below, instead of a
+// sprite — keeps the walk/lunge animation and sidesteps AI sprite-sheet
+// consistency problems entirely. A zoomed-in transform picks a detailed,
+// consistent crop rather than the whole photo shrunk to nothing.
+let clothPattern: CanvasPattern | null = null;
+let skinPattern: CanvasPattern | null = null;
+let steelPattern: CanvasPattern | null = null;
+let uiLeatherPattern: CanvasPattern | null = null;
+
+function makePattern(ctx: CanvasRenderingContext2D, img: HTMLImageElement, scale = 0.4): CanvasPattern | null {
+  const p = ctx.createPattern(img, 'repeat');
+  p?.setTransform(new DOMMatrix().scale(scale));
+  return p;
+}
+
+function getClothPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (!clothPattern && playerTexturesReady()) clothPattern = makePattern(ctx, playerClothImg);
+  return clothPattern;
+}
+function getSkinPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (!skinPattern && playerTexturesReady()) skinPattern = makePattern(ctx, playerSkinImg);
+  return skinPattern;
+}
+function getSteelPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (!steelPattern && playerTexturesReady()) steelPattern = makePattern(ctx, playerSteelImg);
+  return steelPattern;
+}
+/** The same skin photo at a much larger apparent grain, for UI panels —
+ * tinted dark by the caller to read as cured leather or old parchment. */
+function getUiLeatherPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (!uiLeatherPattern && playerTexturesReady()) uiLeatherPattern = makePattern(ctx, playerSkinImg, 1.6);
+  return uiLeatherPattern;
+}
+/** The tarnished-steel photo at UI scale, for metal fittings (orb bezels,
+ * plate rims) — glass and steel read as vessel + fitting, not a hide. */
+let uiSteelPattern: CanvasPattern | null = null;
+function getUiSteelPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (!uiSteelPattern && playerTexturesReady()) uiSteelPattern = makePattern(ctx, playerSteelImg, 1.3);
+  return uiSteelPattern;
+}
+
+/** A #rrggbb color as a partial-alpha rgba() string, for tinting a texture
+ * without fully crushing its own tonal variation under a flat color. */
+function hexTint(hex: string, alpha: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+/** Fills (or strokes, if `stroke`) the current path with a material pattern,
+ * then multiply-tints it to match the look the solid-color fallback had. */
+function paintMaterial(
+  ctx: CanvasRenderingContext2D,
+  pattern: CanvasPattern,
+  tint: string | CanvasGradient,
+  stroke: boolean,
+): void {
+  if (stroke) {
+    ctx.strokeStyle = pattern;
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = pattern;
+    ctx.fill();
+    ctx.save();
+    ctx.clip();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = tint;
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
+  }
+}
+
 function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Player, time: number): void {
   const moving = p.path.length > 0;
   const bob = moving ? Math.sin(p.walkPhase) * 1.6 : Math.sin(time * 2) * 0.7;
   const sway = moving ? Math.sin(p.walkPhase * 0.5) * 1.4 : Math.sin(time * 1.3) * 0.5;
+  // Directional lean: the sword arm drifts toward screen-left/-right while
+  // walking that way, so the model reads as heading somewhere, not just
+  // shuffling in place.
+  let dirBias = 0;
+  if (moving) {
+    const wp = p.path[0];
+    const screenDx = wp.x - p.x - (wp.y - p.y);
+    dirBias = screenDx > 0.02 ? 1 : screenDx < -0.02 ? -1 : 0;
+  }
   const { ox, oy } = lungeOffset(p);
   drawShadow(ctx, fx, fy, 13);
   const x = fx + ox;
@@ -1061,21 +1418,35 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   cg.addColorStop(0, '#1b1d24');
   cg.addColorStop(0.5, '#101116');
   cg.addColorStop(1, '#07080b');
-  ctx.fillStyle = cg;
+  // A body, not a cone: hem -> waist pinch -> shoulder bulge -> neck, so
+  // the silhouette reads as a man in a robe rather than a draped triangle.
   ctx.beginPath();
-  ctx.moveTo(x - 10.5 + sway, y);
-  const hem = [-7.5, -4.5, -1.5, 1.5, 4.5, 7.5];
+  ctx.moveTo(x - 8.5 + sway, y);
+  const hem = [-6, -3.6, -1.2, 1.2, 3.6, 6];
   for (let i = 0; i < hem.length; i++) {
     const lift = (i % 2 === 0 ? -2.4 : 0.5) + Math.sin(p.walkPhase * 0.5 + i * 1.7) * 0.7;
     ctx.lineTo(x + hem[i] + sway * (0.4 + 0.1 * i), y + lift);
   }
-  ctx.lineTo(x + 10.5 + sway, y);
-  ctx.quadraticCurveTo(x + 10, y - 12, x + 7.5, y - 20);
-  ctx.quadraticCurveTo(x + 5.5, y - 24.5, x, y - 25.5);
-  ctx.quadraticCurveTo(x - 5.5, y - 24.5, x - 7.5, y - 20);
-  ctx.quadraticCurveTo(x - 10, y - 12, x - 10.5 + sway, y);
+  ctx.lineTo(x + 8.5 + sway, y);
+  ctx.quadraticCurveTo(x + 8.8, y - 6, x + 6, y - 9.5);
+  ctx.quadraticCurveTo(x + 9.6, y - 14.5, x + 9.3, y - 19.5);
+  ctx.quadraticCurveTo(x + 7.5, y - 23, x + 3.2, y - 24);
+  ctx.quadraticCurveTo(x - 1, y - 25.2, x - 3.2, y - 24);
+  ctx.quadraticCurveTo(x - 7.5, y - 23, x - 9.3, y - 19.5);
+  ctx.quadraticCurveTo(x - 9.6, y - 14.5, x - 6, y - 9.5);
+  ctx.quadraticCurveTo(x - 8.8, y - 6, x - 8.5 + sway, y);
   ctx.closePath();
-  ctx.fill();
+  const cloth = getClothPattern(ctx);
+  if (cloth) {
+    const cgTint = ctx.createLinearGradient(x, y - 30, x, y);
+    cgTint.addColorStop(0, 'rgba(255,255,255,0.7)');
+    cgTint.addColorStop(0.5, 'rgba(255,255,255,0.4)');
+    cgTint.addColorStop(1, 'rgba(255,255,255,0.18)');
+    paintMaterial(ctx, cloth, cgTint, false);
+  } else {
+    ctx.fillStyle = cg;
+    ctx.fill();
+  }
   ctx.strokeStyle = '#07070a';
   ctx.lineWidth = 1.6;
   ctx.stroke();
@@ -1085,47 +1456,67 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   // The cloak parts over a darker inner robe.
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
   ctx.beginPath();
-  ctx.moveTo(x - 1.5, y - 22);
+  ctx.moveTo(x - 1.5, y - 22.5);
   ctx.lineTo(x + 2 + sway * 0.5, y - 2);
   ctx.lineTo(x - 3.5 + sway * 0.5, y - 2);
   ctx.closePath();
   ctx.fill();
-  // Belt with a bone toggle.
+  // Belt with a bone toggle, cinched at the waist pinch.
   ctx.strokeStyle = 'rgba(0,0,0,0.6)';
   ctx.lineWidth = 2.2;
   ctx.beginPath();
-  ctx.moveTo(x - 8.7, y - 12);
-  ctx.quadraticCurveTo(x, y - 10, x + 8.7, y - 12);
+  ctx.moveTo(x - 6.5, y - 10);
+  ctx.quadraticCurveTo(x, y - 8, x + 6.5, y - 10);
   ctx.stroke();
   ctx.fillStyle = '#9aa1a9';
   ctx.beginPath();
-  ctx.ellipse(x - 0.5, y - 10.8, 1.8, 1.1, 0.2, 0, Math.PI * 2);
+  ctx.ellipse(x - 0.5, y - 8.8, 1.8, 1.1, 0.2, 0, Math.PI * 2);
   ctx.fill();
-  // Cold rim light down the left edge.
+  // Cold rim light tracing shoulder to hem, down the left edge.
   ctx.strokeStyle = 'rgba(185,196,210,0.26)';
   ctx.lineWidth = 1.2;
   ctx.beginPath();
-  ctx.moveTo(x - 10 + sway, y - 2);
-  ctx.quadraticCurveTo(x - 9, y - 16, x - 3, y - 24.5);
+  ctx.moveTo(x - 8.5 + sway, y - 2);
+  ctx.quadraticCurveTo(x - 9.6, y - 14.5, x - 9.3, y - 19.5);
+  ctx.quadraticCurveTo(x - 7.5, y - 23, x - 3.2, y - 24);
   ctx.stroke();
 
   drawArmorDecor(ctx, x, y, p.armor?.tier ?? 0);
 
-  // Sword arm: a sleeve falling to a pale hand on the grip.
+  // Sword arm: a sleeve falling from the shoulder to a pale hand on the
+  // grip, drifting with dirBias toward the direction of travel.
+  const armX = x + dirBias * 3.2;
   ctx.strokeStyle = '#0d0e12';
   ctx.lineWidth = 3.2;
   ctx.beginPath();
-  ctx.moveTo(x + 4.5, y - 19);
-  ctx.quadraticCurveTo(x + 8, y - 15, x + 7, y - 9.5);
+  ctx.moveTo(armX + 6.5, y - 19);
+  ctx.quadraticCurveTo(armX + 9, y - 15, armX + 7, y - 9.5);
   ctx.stroke();
   ctx.fillStyle = '#cfd3d8';
   ctx.beginPath();
-  ctx.arc(x + 7, y - 9, 1.6, 0, Math.PI * 2);
+  ctx.arc(armX + 7, y - 9, 1.6, 0, Math.PI * 2);
   ctx.fill();
-  drawWeaponIdle(ctx, x, y, p.weapon.tier);
+  drawWeaponIdle(ctx, armX, y, p.weapon.tier);
+
+  // Off-hand: a small round shield at the hip, drifting with dirBias the
+  // same way the sword arm does, so both arms lean together.
+  const shieldX = x - 7.5 + dirBias * 3.2;
+  const shieldY = y - 13;
+  ctx.beginPath();
+  ctx.arc(shieldX, shieldY, 4.4, 0, Math.PI * 2);
+  const steelShield = getSteelPattern(ctx);
+  if (steelShield) {
+    paintMaterial(ctx, steelShield, 'rgba(14,14,17,0.6)', false);
+  } else {
+    ctx.fillStyle = '#2a2d33';
+    ctx.fill();
+  }
+  ctx.strokeStyle = '#0a0a0c';
+  ctx.lineWidth = 1.3;
+  ctx.stroke();
+  drawInvertedCross(ctx, shieldX, shieldY, 2.6, 0.65);
 
   // Peaked hood, its tip nodding with the walk.
-  ctx.fillStyle = '#14161b';
   ctx.beginPath();
   ctx.moveTo(x - 6.8, y - 23.5);
   ctx.quadraticCurveTo(x - 7.2, y - 30, x - 4, y - 33.5);
@@ -1133,7 +1524,12 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   ctx.quadraticCurveTo(x + 6, y - 31.5, x + 6.6, y - 23.5);
   ctx.quadraticCurveTo(x, y - 27, x - 6.8, y - 23.5);
   ctx.closePath();
-  ctx.fill();
+  if (cloth) {
+    paintMaterial(ctx, cloth, 'rgba(255,255,255,0.5)', false);
+  } else {
+    ctx.fillStyle = '#14161b';
+    ctx.fill();
+  }
   ctx.strokeStyle = '#07070a';
   ctx.lineWidth = 1.4;
   ctx.stroke();
@@ -1150,10 +1546,15 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   ctx.beginPath();
   ctx.ellipse(x + 0.2, y - 27.6, 4.6, 4.2, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = '#cfd3d8';
   ctx.beginPath();
   ctx.ellipse(x + 0.3, y - 27.2, 3.6, 3.7, 0, 0, Math.PI * 2);
-  ctx.fill();
+  const skin = getSkinPattern(ctx);
+  if (skin) {
+    paintMaterial(ctx, skin, 'rgba(225,225,230,0.85)', false);
+  } else {
+    ctx.fillStyle = '#cfd3d8';
+    ctx.fill();
+  }
   // Blackened sockets and the streaks beneath them.
   ctx.fillStyle = '#0a0a0c';
   ctx.beginPath();
@@ -1197,6 +1598,7 @@ const SLASH_TINT: Record<number, string> = {
   4: '191,227,245', // Frostbrand — cold light
   5: '225,170,170', // Bloodmoon Scythe — a red gleam
   6: '238,238,248', // Transilvanian Hunger — stark white
+  7: '210,20,35', // Bloodletter — a wet crimson arc
 };
 
 /** The equipped weapon, resting against the shoulder. */
@@ -1285,8 +1687,38 @@ function drawWeaponIdle(ctx: CanvasRenderingContext2D, x: number, y: number, tie
       ctx.lineTo(x + 16.8, y - 27.4);
       ctx.stroke();
       break;
+    case 7: // Bloodletter — a barbed edge, wet and dark
+      ctx.strokeStyle = '#26181a';
+      ctx.lineWidth = 3.2;
+      ctx.beginPath();
+      ctx.moveTo(x + 7, y - 9);
+      ctx.lineTo(x + 16, y - 27);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(190,20,30,0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 7.6, y - 10);
+      ctx.lineTo(x + 15.6, y - 26);
+      ctx.stroke();
+      // Serrations.
+      ctx.strokeStyle = '#1a1113';
+      ctx.lineWidth = 1;
+      for (const t of [0.3, 0.55, 0.8]) {
+        const bx = x + 7 + (16 - 7) * t;
+        const by = y - 9 + (-27 + 9) * t;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(bx + 2.2, by + 0.8);
+        ctx.stroke();
+      }
+      // A bead of blood at the tip.
+      ctx.fillStyle = 'rgba(200,20,30,0.85)';
+      ctx.beginPath();
+      ctx.arc(x + 16, y - 27, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+      break;
     default: // Rusted Blade
-      ctx.strokeStyle = '#8f959d';
+      ctx.strokeStyle = getSteelPattern(ctx) ?? '#8f959d';
       ctx.lineWidth = 1.8;
       ctx.beginPath();
       ctx.moveTo(x + 7, y - 9);
@@ -1717,8 +2149,16 @@ function torsoPath(ctx: CanvasRenderingContext2D): void {
 
 function drawTorso(ctx: CanvasRenderingContext2D, fill: string, trim: string): void {
   torsoPath(ctx);
-  ctx.fillStyle = fill;
-  ctx.fill();
+  // Mail/hide, tinted per body color — shared by the draugr and every boss,
+  // so the whole enemy roster gets the same material treatment the wretch
+  // and boss heads already have.
+  const steel = getSteelPattern(ctx);
+  if (steel) {
+    paintMaterial(ctx, steel, hexTint(fill, 0.62), false);
+  } else {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
   // Volume: shadow pooling toward the hem and the right flank.
   const g = ctx.createLinearGradient(0, -24, 0, 0);
   g.addColorStop(0, 'rgba(255,255,255,0.08)');
@@ -1775,11 +2215,17 @@ function drawBossBody(ctx: CanvasRenderingContext2D, e: Enemy, time: number): vo
       ctx.lineTo(fx2 * 1.3, fy2 - 2.4);
     }
     ctx.stroke();
-    ctx.fillStyle = look.skin;
     ctx.beginPath();
     ctx.arc(0, -28, 4.5, 0, Math.PI * 2);
-    ctx.fill();
+    const bossSkin = getSkinPattern(ctx);
+    if (bossSkin) {
+      paintMaterial(ctx, bossSkin, hexTint(look.skin, 0.65), false);
+    } else {
+      ctx.fillStyle = look.skin;
+      ctx.fill();
+    }
     // Muzzle with parted jaws.
+    ctx.fillStyle = look.skin;
     ctx.beginPath();
     ctx.moveTo(1, -29.5);
     ctx.lineTo(7.5, -27.5);
@@ -1845,7 +2291,6 @@ function drawBossBody(ctx: CanvasRenderingContext2D, e: Enemy, time: number): vo
     ctx.fill();
   } else {
     // A bared skull: cranium, hollow sockets, nasal cleft, gritted teeth.
-    ctx.fillStyle = look.skin;
     ctx.beginPath();
     ctx.arc(0, -28.6, 4.6, Math.PI * 0.86, Math.PI * 0.14);
     ctx.lineTo(3.9, -26);
@@ -1853,7 +2298,13 @@ function drawBossBody(ctx: CanvasRenderingContext2D, e: Enemy, time: number): vo
     ctx.lineTo(-1.8, -24);
     ctx.quadraticCurveTo(-3, -24.2, -3.9, -26);
     ctx.closePath();
-    ctx.fill();
+    const skullSkin = getSkinPattern(ctx);
+    if (skullSkin) {
+      paintMaterial(ctx, skullSkin, hexTint(look.skin, 0.65), false);
+    } else {
+      ctx.fillStyle = look.skin;
+      ctx.fill();
+    }
     ctx.strokeStyle = 'rgba(7,7,10,0.7)';
     ctx.lineWidth = 0.8;
     ctx.stroke();
@@ -1923,15 +2374,30 @@ function drawEnemy(
   ctx.globalAlpha = Math.min(1, b * 1.4);
   const bob = e.path.length > 0 ? Math.sin(e.walkPhase) * 1.4 : 0;
   const { ox, oy } = lungeOffset(e);
-  const scale = e.kind === 'boss' ? 1.6 : 1;
+  const scale = e.kind === 'boss' ? 1.6 : e.kind === 'brute' ? 1.3 : e.rare ? 1.2 : 1;
   drawShadow(ctx, fx, fy, (e.kind === 'wretch' ? 9 : 12) * scale);
 
   if (e.kind === 'boss') {
-    // Aura seething at his feet, tinted per boss.
-    ctx.strokeStyle = `rgba(${bossLook(e).aura},${0.16 + 0.1 * Math.sin(time * 3)})`;
-    ctx.lineWidth = 1.5;
+    const enraged = e.hp / e.maxHp <= 0.3;
+    // Aura seething at his feet, tinted per boss — flares faster and redder
+    // once enraged, the only warning before its cadence spikes.
+    const auraRgb = enraged ? '210,50,40' : bossLook(e).aura;
+    const pulseHz = enraged ? 8 : 3;
+    ctx.strokeStyle = `rgba(${auraRgb},${(enraged ? 0.24 : 0.16) + 0.1 * Math.sin(time * pulseHz)})`;
+    ctx.lineWidth = enraged ? 2.2 : 1.5;
     ctx.beginPath();
-    ctx.ellipse(fx, fy, 22 + Math.sin(time * 3) * 2, 10, 0, 0, Math.PI * 2);
+    ctx.ellipse(fx, fy, 22 + Math.sin(time * pulseHz) * 2, 10, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (e.kind === 'brute' && e.windupT > 0) {
+    // Ground tell for the slam — the radius it's about to hit, filling in
+    // as the windup completes so the player can read the deadline.
+    const fill = 1 - e.windupT / 0.7;
+    ctx.strokeStyle = `rgba(210,60,50,${0.35 + 0.35 * Math.sin(time * 16)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(fx, fy, 34 * fill, 15 * fill, 0, 0, Math.PI * 2);
     ctx.stroke();
   }
 
@@ -1953,7 +2419,6 @@ function drawEnemy(
     wg.addColorStop(0, '#6a707a');
     wg.addColorStop(0.55, '#4d525a');
     wg.addColorStop(1, '#33373d');
-    ctx.fillStyle = wg;
     ctx.beginPath();
     ctx.moveTo(-9, -2);
     ctx.quadraticCurveTo(-11.5, -8.5, -6.5, -12.5);
@@ -1962,7 +2427,13 @@ function drawEnemy(
     ctx.quadraticCurveTo(8, -2.5, 4, -1);
     ctx.quadraticCurveTo(-3, 1.2, -9, -2);
     ctx.closePath();
-    ctx.fill();
+    const wretchSkin = getSkinPattern(ctx);
+    if (wretchSkin) {
+      paintMaterial(ctx, wretchSkin, 'rgba(150,168,148,0.55)', false);
+    } else {
+      ctx.fillStyle = wg;
+      ctx.fill();
+    }
     ctx.strokeStyle = '#07070a';
     ctx.lineWidth = 1.4;
     ctx.stroke();
@@ -2000,10 +2471,14 @@ function drawEnemy(
     }
     ctx.stroke();
     // Head slung low ahead of the shoulders, jaw hanging.
-    ctx.fillStyle = '#787f89';
     ctx.beginPath();
     ctx.ellipse(6.5, -9.5, 3.6, 3, 0.35, 0, Math.PI * 2);
-    ctx.fill();
+    if (wretchSkin) {
+      paintMaterial(ctx, wretchSkin, 'rgba(155,172,152,0.55)', false);
+    } else {
+      ctx.fillStyle = '#787f89';
+      ctx.fill();
+    }
     ctx.strokeStyle = '#07070a';
     ctx.lineWidth = 1;
     ctx.stroke();
@@ -2024,6 +2499,166 @@ function drawEnemy(
     ctx.fill();
   } else if (e.kind === 'boss') {
     drawBossBody(ctx, e, time);
+  } else if (e.kind === 'volva') {
+    // A hooded seer — thin, robed, staff-borne, never swings a blade.
+    const sway = e.path.length > 0 ? Math.sin(e.walkPhase) * 1.2 : Math.sin(time * 1.4) * 0.6;
+    drawTorso(ctx, '#2c2438', 'rgba(160,120,210,0.35)');
+    // Staff planted at her side, topped with a pulsing frost orb.
+    ctx.strokeStyle = '#241d2c';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(9 + sway, -2);
+    ctx.lineTo(11 + sway * 1.5, -27);
+    ctx.stroke();
+    const orbPulse = 2 + Math.sin(time * 4) * 0.5;
+    eyeGlow(ctx, 11 + sway * 1.5, -28, '140,205,235', 5 + orbPulse);
+    ctx.fillStyle = '#cfe8f5';
+    ctx.beginPath();
+    ctx.arc(11 + sway * 1.5, -28, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+    // Deep hood, face lost to shadow but for two cold eyes.
+    ctx.fillStyle = '#1c1722';
+    ctx.beginPath();
+    ctx.ellipse(0, -27, 5, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#07070a';
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    eyeGlow(ctx, -1.6, -26.5, '175,140,225');
+    eyeGlow(ctx, 1.6, -26.5, '175,140,225');
+    ctx.fillStyle = '#d9c8f0';
+    ctx.beginPath();
+    ctx.arc(-1.6, -26.5, 0.7, 0, Math.PI * 2);
+    ctx.arc(1.6, -26.5, 0.7, 0, Math.PI * 2);
+    ctx.fill();
+    // A tattered veil trailing off the hood's point.
+    ctx.strokeStyle = 'rgba(160,120,210,0.4)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(0, -32.5);
+    ctx.quadraticCurveTo(-1.5 + sway, -34.5, -0.5 + sway * 1.6, -36.5);
+    ctx.stroke();
+  } else if (e.kind === 'ratling') {
+    // A skittering vermin, always found in a pack — low, quick, disposable.
+    const scurry = e.path.length > 0 ? Math.sin(e.walkPhase * 1.6) * 1.6 : 0;
+    // Whip tail.
+    ctx.strokeStyle = '#4a4144';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(-5, -3);
+    ctx.quadraticCurveTo(-9, -1 + scurry * 0.4, -11, -3.5 - scurry * 0.4);
+    ctx.stroke();
+    // Legs, blurred with motion.
+    ctx.strokeStyle = '#26211f';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(-2, -1);
+    ctx.lineTo(-2.5 + scurry, 1);
+    ctx.moveTo(2, -1);
+    ctx.lineTo(2.5 - scurry, 1);
+    ctx.stroke();
+    // Hunched, mangy body.
+    const rg = ctx.createLinearGradient(0, -8, 0, 0);
+    rg.addColorStop(0, '#5c4f47');
+    rg.addColorStop(1, '#332a25');
+    ctx.beginPath();
+    ctx.ellipse(-1, -4, 5.5, 3.6, 0.15, 0, Math.PI * 2);
+    ctx.fillStyle = rg;
+    ctx.fill();
+    ctx.strokeStyle = '#07070a';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // Ragged ears atop a narrow skull.
+    ctx.fillStyle = '#332a25';
+    ctx.beginPath();
+    ctx.moveTo(4, -8);
+    ctx.lineTo(6, -10.5);
+    ctx.lineTo(5.5, -7.5);
+    ctx.closePath();
+    ctx.moveTo(6.5, -6.5);
+    ctx.lineTo(8.5, -8.5);
+    ctx.lineTo(7.5, -6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(6.5, -6, 2.6, 2.1, 0.2, 0, Math.PI * 2);
+    ctx.fillStyle = '#4a3d35';
+    ctx.fill();
+    ctx.strokeStyle = '#07070a';
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+    // Beady red eyes and bared teeth.
+    eyeGlow(ctx, 7.5, -6.3, '210,60,50', 2);
+    ctx.fillStyle = '#e8555f';
+    ctx.beginPath();
+    ctx.arc(7.5, -6.3, 0.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#e8e4dc';
+    ctx.beginPath();
+    ctx.moveTo(8.5, -5.2);
+    ctx.lineTo(9.3, -4.6);
+    ctx.lineTo(8.4, -4.5);
+    ctx.closePath();
+    ctx.fill();
+  } else if (e.kind === 'brute') {
+    // A slab of a corpse in rusted plate — slow, and telegraphs its slam
+    // with a windup the player can see (and dodge) coming.
+    const winding = e.windupT > 0;
+    const stride = !winding && e.path.length > 0 ? Math.sin(e.walkPhase) * 1.6 : 0;
+    ctx.strokeStyle = '#1c1f24';
+    ctx.lineWidth = 3.6;
+    ctx.beginPath();
+    ctx.moveTo(-4 + stride, -3);
+    ctx.lineTo(-4.5 + stride, 0.5);
+    ctx.moveTo(4 - stride, -3);
+    ctx.lineTo(4.5 - stride, 0.5);
+    ctx.stroke();
+    drawTorso(ctx, '#3a3230', 'rgba(201,150,120,0.3)');
+    // Studded, riveted bands across the chest.
+    ctx.strokeStyle = 'rgba(15,13,12,0.65)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    for (const my of [-19, -15.5]) {
+      ctx.moveTo(-9, my);
+      ctx.quadraticCurveTo(0, my + 1.8, 9, my);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#8a7c6c';
+    for (const [rx, ry] of [[-6, -18.4], [0, -16.5], [6, -18.4]]) {
+      ctx.beginPath();
+      ctx.arc(rx, ry, 0.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // A raised maul, wound up over the shoulder while telegraphing.
+    const raise = winding ? Math.min(1, 1 - e.windupT / 0.7) : 0.15;
+    ctx.strokeStyle = '#2a2622';
+    ctx.lineWidth = 2.6;
+    ctx.beginPath();
+    ctx.moveTo(8, -20);
+    ctx.quadraticCurveTo(12 + raise * 3, -22 - raise * 10, 13 + raise * 4, -30 - raise * 10);
+    ctx.stroke();
+    ctx.fillStyle = winding ? `rgba(180,60,50,${0.6 + 0.3 * Math.sin(time * 14)})` : '#565048';
+    ctx.beginPath();
+    ctx.arc(13 + raise * 4, -30 - raise * 10, 3.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#07070a';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // Squat, brutal head, jaw set low.
+    ctx.fillStyle = '#4a423c';
+    ctx.beginPath();
+    ctx.ellipse(0, -26.5, 5.4, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#07070a';
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+    eyeGlow(ctx, -2, -27, '220,140,60');
+    eyeGlow(ctx, 2, -27, '220,140,60');
+    ctx.fillStyle = '#f0c890';
+    ctx.beginPath();
+    ctx.arc(-2, -27, 0.8, 0, Math.PI * 2);
+    ctx.arc(2, -27, 0.8, 0, Math.PI * 2);
+    ctx.fill();
   } else {
     // Draugr — a frost-bound revenant in grave-mail.
     const stride = e.path.length > 0 ? Math.sin(e.walkPhase) * 2 : 0;
@@ -2136,12 +2771,39 @@ function drawEnemy(
     ctx.fill();
   }
 
+  // Rare: a meaner silhouette (extra spikes) and a color tint, so a unique
+  // reads as dangerous before you're close enough to see its name.
+  if (e.rare) {
+    drawRareSpikes(ctx, e.rare.seed);
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = `rgba(${e.rare.tint},0.5)`;
+    ctx.beginPath();
+    ctx.ellipse(0, -12, 11, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
   // Frost-slow sheathes them in ice.
   if (e.slowT > 0) {
     ctx.fillStyle = `rgba(150,200,225,${Math.min(0.35, e.slowT * 0.18)})`;
     ctx.beginPath();
     ctx.ellipse(0, -12, 10, 14, 0, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  // Bleeding: droplets welling up and falling while the bleed ticks.
+  if (e.bleedT > 0) {
+    const drops = 3;
+    for (let i = 0; i < drops; i++) {
+      const seed = i * 47 + Math.floor(e.bleedT * 3);
+      const fall = (time * 1.8 + seed) % 1;
+      const dx = (Math.sin(seed) - 0.5) * 8;
+      ctx.fillStyle = `rgba(190,20,30,${(1 - fall) * 0.75})`;
+      ctx.beginPath();
+      ctx.arc(dx, -10 + fall * 12, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   if (e.flash > 0) {
@@ -2167,6 +2829,9 @@ function drawEnemy(
 
 export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt: number): void {
   const { w, h } = view;
+  // Low-res source photos + nearest-neighbor scaling = chunky 90s pixels
+  // instead of a smooth blur, for every drawImage/pattern this frame.
+  ctx.imageSmoothingEnabled = false;
   if (game.screen === 'title') {
     drawTitle(ctx, game, view, dt);
     return;
@@ -2178,6 +2843,13 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
 
   const { offX, offY } = getCamOffset(game, w, h);
   const d = game.dungeon;
+
+  // Zoom the whole world view about screen center; screenToWorldTile()
+  // mirrors this so mouse targeting still lines up.
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.scale(ZOOM, ZOOM);
+  ctx.translate(-w / 2, -h / 2);
 
   // Cached dim world, then live torchlit region on top.
   ensureStatic(d);
@@ -2246,7 +2918,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
   }
 
   // Hover tile highlight.
-  const tp = screenToTile(view.mouseX - offX, view.mouseY - offY);
+  const tp = screenToWorldTile(view.mouseX, view.mouseY, offX, offY, w, h);
   const htx = Math.floor(tp.x);
   const hty = Math.floor(tp.y);
   if (game.screen === 'playing' && !game.hoverEnemy && htx >= 0 && hty >= 0 && htx < d.w && hty < d.h) {
@@ -2320,16 +2992,68 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
   for (const pr of game.projectiles) {
     const cx = offX + isoX(pr.x, pr.y);
     const cy = offY + isoY(pr.x, pr.y) + HH - 14;
+    // A Völva's bolt reads cold (icy blue) instead of the player's warm
+    // fireball, so the player can tell at a glance who threw it.
     const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, 10);
-    glow.addColorStop(0, 'rgba(255,220,170,0.9)');
-    glow.addColorStop(0.4, 'rgba(255,140,50,0.5)');
-    glow.addColorStop(1, 'rgba(255,120,30,0)');
+    if (pr.hostile) {
+      glow.addColorStop(0, 'rgba(200,235,255,0.9)');
+      glow.addColorStop(0.4, 'rgba(110,190,230,0.5)');
+      glow.addColorStop(1, 'rgba(90,170,220,0)');
+    } else {
+      glow.addColorStop(0, 'rgba(255,220,170,0.9)');
+      glow.addColorStop(0.4, 'rgba(255,140,50,0.5)');
+      glow.addColorStop(1, 'rgba(255,120,30,0)');
+    }
     ctx.fillStyle = glow;
     ctx.fillRect(cx - 11, cy - 11, 22, 22);
-    ctx.fillStyle = '#ffb864';
+    ctx.fillStyle = pr.hostile ? '#a8dcf5' : '#ffb864';
     ctx.beginPath();
     ctx.arc(cx, cy, 2.6, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  // Plague Bloom: a lingering sickly cloud, ground-level so spell rings
+  // above still read clearly over it. A boss's hostile version washes
+  // blood-red instead of the player's sickly green, so it never reads as
+  // a safe zone.
+  for (const hz of game.hazards) {
+    const cx = offX + isoX(hz.x, hz.y);
+    const cy = offY + isoY(hz.x, hz.y) + HH;
+    const lifeT = 1 - hz.ttl / hz.maxTtl;
+    const envelope = Math.min(1, lifeT * 6) * Math.min(1, (1 - lifeT) * 4);
+    const rx = hz.r * HW;
+    const ry = hz.r * HH;
+    const pulse = 0.85 + 0.15 * Math.sin(game.time * 3 + hz.x * 3);
+    const core = hz.hostile ? '190,60,50' : '120,190,90';
+    const edge = hz.hostile ? '150,45,45' : '90,150,70';
+    const mote = hz.hostile ? '225,100,90' : '170,225,140';
+    const wash = ctx.createRadialGradient(cx, cy, 0, cx, cy, rx * pulse);
+    wash.addColorStop(0, `rgba(${core},${0.28 * envelope})`);
+    wash.addColorStop(0.7, `rgba(${edge},${0.16 * envelope})`);
+    wash.addColorStop(1, `rgba(${edge},0)`);
+    ctx.fillStyle = wash;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx * pulse, ry * pulse, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = hz.hostile ? `rgba(220,90,80,${0.35 * envelope})` : `rgba(150,210,120,${0.35 * envelope})`;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx * pulse, ry * pulse, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    // Motes bubbling up out of the rot.
+    const motes = 5;
+    for (let i = 0; i < motes; i++) {
+      const seed = hz.x * 13 + hz.y * 7 + i * 31;
+      const a = (i / motes) * Math.PI * 2 + seed;
+      const dist = ((Math.sin(seed) + 1) / 2) * 0.75;
+      const mx = cx + Math.cos(a) * rx * dist;
+      const rise = ((game.time * 0.6 + seed) % 1) * 14;
+      const my = cy + Math.sin(a) * ry * dist - rise;
+      ctx.fillStyle = `rgba(${mote},${envelope * 0.6 * (1 - rise / 14)})`;
+      ctx.beginPath();
+      ctx.arc(mx, my, 1.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   // Spell and level-up effects ring outward in world space.
@@ -2339,6 +3063,16 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
     const fade = 1 - ef.t;
     if (ef.kind === 'nova') {
       const col = ef.color ?? '190,222,238';
+      // Soft inner wash, so the ring reads as a shockwave, not a wire outline.
+      const rMax = ef.t * ef.r * Math.SQRT2;
+      const wash = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(1, rMax * HW));
+      wash.addColorStop(0, `rgba(${col},0)`);
+      wash.addColorStop(0.75, `rgba(${col},${fade * 0.05})`);
+      wash.addColorStop(1, `rgba(${col},${fade * 0.16})`);
+      ctx.fillStyle = wash;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rMax * HW, rMax * HH, 0, 0, Math.PI * 2);
+      ctx.fill();
       for (const f of [1, 0.72]) {
         const r = ef.t * ef.r * f * Math.SQRT2;
         ctx.strokeStyle = `rgba(${col},${fade * 0.8 * f})`;
@@ -2347,9 +3081,31 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
         ctx.ellipse(cx, cy, r * HW, r * HH, 0, 0, Math.PI * 2);
         ctx.stroke();
       }
+      // Shards flung outward along the leading ring.
+      const shards = 10;
+      for (let i = 0; i < shards; i++) {
+        const a = (i / shards) * Math.PI * 2 + ef.x * 0.7;
+        const sx = cx + Math.cos(a) * rMax * HW;
+        const sy = cy + Math.sin(a) * rMax * HH;
+        ctx.strokeStyle = `rgba(${col},${fade * 0.85})`;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(sx - Math.cos(a) * 4, sy - Math.sin(a) * 4);
+        ctx.lineTo(sx + Math.cos(a) * 3, sy + Math.sin(a) * 3);
+        ctx.stroke();
+      }
     } else if (ef.kind === 'boom') {
       const col = ef.color ?? '255,150,60';
       const r = ef.t * ef.r * Math.SQRT2;
+      // Hot flash at the core, fiercest the instant it goes off.
+      if (ef.t < 0.4) {
+        const flashA = (1 - ef.t / 0.4) * 0.8;
+        const flash = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(1, r * HW * 1.3));
+        flash.addColorStop(0, `rgba(255,235,190,${flashA})`);
+        flash.addColorStop(1, 'rgba(255,235,190,0)');
+        ctx.fillStyle = flash;
+        ctx.fillRect(cx - r * HW * 1.3, cy - r * HH * 1.3, r * HW * 2.6, r * HH * 2.6);
+      }
       ctx.fillStyle = `rgba(${col},${fade * 0.4})`;
       ctx.beginPath();
       ctx.ellipse(cx, cy, r * HW, r * HH, 0, 0, Math.PI * 2);
@@ -2359,6 +3115,18 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
       ctx.beginPath();
       ctx.ellipse(cx, cy, r * HW, r * HH, 0, 0, Math.PI * 2);
       ctx.stroke();
+      // Embers spat outward and guttering as they cool.
+      const embers = 8;
+      for (let i = 0; i < embers; i++) {
+        const a = (i / embers) * Math.PI * 2 + ef.y * 0.9;
+        const dist = ef.t * (0.55 + (i % 3) * 0.18);
+        const ex2 = cx + Math.cos(a) * dist * ef.r * HW * Math.SQRT2;
+        const ey2 = cy + Math.sin(a) * dist * ef.r * HH * Math.SQRT2 - ef.t * 10;
+        ctx.fillStyle = `rgba(255,${170 + (i % 3) * 20},90,${fade})`;
+        ctx.beginPath();
+        ctx.arc(ex2, ey2, 1.6 - ef.t * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
     } else if (ef.kind === 'bolt') {
       // Jagged bolt, re-jittered every frame so it crackles.
       const ex = offX + isoX(ef.x2 ?? ef.x, ef.y2 ?? ef.y);
@@ -2385,6 +3153,46 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
         for (const [px2, py2] of pts.slice(1)) ctx.lineTo(px2, py2);
         ctx.stroke();
       }
+      // A short branching fork, and a flash where the bolt strikes home.
+      const midI = Math.floor(segs / 2);
+      const [mx, my] = pts[midI];
+      ctx.strokeStyle = `rgba(210,205,255,${fade * 0.7})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(mx, my);
+      ctx.lineTo(mx + (Math.random() - 0.5) * 14, my + (Math.random() - 0.5) * 14 + 6);
+      ctx.stroke();
+      const strike = ctx.createRadialGradient(ex, ey, 0, ex, ey, 12);
+      strike.addColorStop(0, `rgba(225,220,255,${fade * 0.8})`);
+      strike.addColorStop(1, 'rgba(225,220,255,0)');
+      ctx.fillStyle = strike;
+      ctx.fillRect(ex - 12, ey - 12, 24, 24);
+    } else if (ef.kind === 'drain') {
+      // A crimson tendril linking caster and target, with droplets flowing
+      // back toward the caster — blood spent to buy blood.
+      const ex = offX + isoX(ef.x2 ?? ef.x, ef.y2 ?? ef.y);
+      const ey = offY + isoY(ef.x2 ?? ef.x, ef.y2 ?? ef.y) + HH - 12;
+      const sy = cy - 16;
+      const mx = (cx + ex) / 2 + Math.sin(ef.t * 9) * 6;
+      const my = (sy + ey) / 2 + Math.cos(ef.t * 7) * 4;
+      ctx.strokeStyle = `rgba(180,20,30,${fade * 0.75})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx, sy);
+      ctx.quadraticCurveTo(mx, my, ex, ey);
+      ctx.stroke();
+      ctx.strokeStyle = `rgba(230,90,95,${fade * 0.5})`;
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      for (let i = 0; i < 4; i++) {
+        const u = 1 - ((ef.t * 2.5 + i * 0.25) % 1);
+        const dx0 = (1 - u) * (1 - u) * cx + 2 * (1 - u) * u * mx + u * u * ex;
+        const dy0 = (1 - u) * (1 - u) * sy + 2 * (1 - u) * u * my + u * u * ey;
+        ctx.fillStyle = `rgba(200,30,40,${fade * 0.8})`;
+        ctx.beginPath();
+        ctx.arc(dx0, dy0, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
     } else {
       const r = ef.t * ef.r * Math.SQRT2;
       ctx.strokeStyle = `rgba(235,228,200,${fade * 0.75})`;
@@ -2395,17 +3203,27 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
     }
   }
 
-  // Floating damage numbers.
+  // Floating damage numbers — a quick pop on spawn, settling as they drift.
   ctx.textAlign = 'center';
   for (const n of game.dmgNums) {
     const nx = offX + isoX(n.x, n.y);
     const ny = offY + isoY(n.x, n.y) - 30 - (1 - n.t) * 28;
     ctx.globalAlpha = Math.min(1, n.t * 1.6);
-    ctx.font = `bold 15px ${FONT_GOTHIC}`;
+    const pop = n.t > 0.82 ? 1 + (n.t - 0.82) * 3.4 : 1;
+    ctx.save();
+    ctx.translate(nx, ny);
+    ctx.scale(pop, pop);
+    ctx.font = `bold 17px ${FONT_GOTHIC}`;
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.lineWidth = 3;
+    ctx.strokeText(n.value, 0, 0);
     ctx.fillStyle = n.color;
-    ctx.fillText(n.value, nx, ny);
+    ctx.fillText(n.value, 0, 0);
+    ctx.restore();
   }
   ctx.globalAlpha = 1;
+
+  ctx.restore(); // end zoom transform — HUD/snow/vignette/grain stay screen-space
 
   // Ash-snow drifting over everything.
   updateSnow(dt, w, h, game.time);
@@ -2469,12 +3287,17 @@ function drawTitle(ctx: CanvasRenderingContext2D, game: Game, view: View, dt: nu
       view.mouseX <= item.x + item.w &&
       view.mouseY >= item.y &&
       view.mouseY <= item.y + item.h;
-    ctx.font = `28px ${FONT_GOTHIC}`;
-    ctx.fillStyle = hovered ? 'rgba(230,236,244,0.95)' : 'rgba(185,192,202,0.75)';
-    ctx.fillText(hovered ? `✠ ${item.label} ✠` : item.label, w / 2, item.y + 27);
-    ctx.font = '12px Georgia, serif';
-    ctx.fillStyle = 'rgba(150,156,166,0.45)';
-    ctx.fillText(`[${item.hint}]`, w / 2, item.y + 44);
+    ctx.font = `bold 32px ${FONT_GOTHIC}`;
+    const labelW = ctx.measureText(item.label).width;
+    ctx.fillStyle = hovered ? 'rgba(235,240,246,0.98)' : 'rgba(195,201,210,0.82)';
+    ctx.fillText(item.label, w / 2, item.y + 30);
+    if (hovered) {
+      drawInvertedCross(ctx, w / 2 - labelW / 2 - 30, item.y + 22, 12, 0.85);
+      drawInvertedCross(ctx, w / 2 + labelW / 2 + 30, item.y + 22, 12, 0.85);
+    }
+    ctx.font = `13px ${FONT_GOTHIC}`;
+    ctx.fillStyle = 'rgba(170,176,186,0.6)';
+    ctx.fillText(`[${item.hint}]`, w / 2, item.y + 48);
   }
 
   const r = game.records;
@@ -2512,6 +3335,41 @@ function drawPause(ctx: CanvasRenderingContext2D, view: View): void {
   ctx.fillText('Esc — return to the dark', w / 2, h * 0.42 + 46);
   ctx.fillText('T — abandon to the title (run kept at last depth)', w / 2, h * 0.42 + 74);
   ctx.fillText('M — mute', w / 2, h * 0.42 + 102);
+
+  // Volume control.
+  const vol = getVolume();
+  const layout = pauseVolumeLayout(w, h);
+  ctx.font = `bold 15px ${FONT_GOTHIC}`;
+  fillTextPop(ctx, `Volume  ${Math.round(vol * 100)}%`, w / 2, layout.cy - 22);
+  const barW = 100;
+  const barX = w / 2 - barW / 2;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(barX, layout.cy - 4, barW, 8);
+  ctx.fillStyle = 'rgba(190,198,210,0.9)';
+  ctx.fillRect(barX, layout.cy - 4, barW * vol, 8);
+  ctx.strokeStyle = 'rgba(210,216,224,0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, layout.cy - 4, barW, 8);
+  for (const [btn, label] of [
+    [layout.minus, '−'],
+    [layout.plus, '+'],
+  ] as const) {
+    ctx.beginPath();
+    ctx.arc(btn.x, btn.y, btn.r, 0, Math.PI * 2);
+    const steel = getUiSteelPattern(ctx);
+    if (steel) {
+      paintMaterial(ctx, steel, 'rgba(10,10,12,0.75)', false);
+    } else {
+      ctx.fillStyle = '#1c1d21';
+      ctx.fill();
+    }
+    ctx.strokeStyle = 'rgba(200,205,212,0.4)';
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.font = `bold 18px ${FONT_GOTHIC}`;
+    ctx.fillStyle = '#e8ebf0';
+    ctx.fillText(label, btn.x, btn.y + 6);
+  }
 }
 
 // --- HUD --------------------------------------------------------------
@@ -2526,6 +3384,27 @@ function drawOrb(
   time: number,
   label: string,
 ): void {
+  // Iron bezel — a tarnished-steel ring the glass sits in.
+  const bezelR = r + 9;
+  ctx.beginPath();
+  ctx.arc(cx, cy, bezelR, 0, Math.PI * 2);
+  const steel = getUiSteelPattern(ctx);
+  if (steel) {
+    paintMaterial(ctx, steel, 'rgba(18,18,20,0.72)', false);
+  } else {
+    ctx.fillStyle = '#1c1d21';
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(200,205,212,0.22)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, bezelR - 2, 0, Math.PI * 2);
+  ctx.stroke();
+  drawInvertedCross(ctx, cx, cy - bezelR + 7, 5, 0.55);
+
   ctx.save();
   ctx.beginPath();
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -2545,94 +3424,327 @@ function drawOrb(
   ctx.closePath();
   ctx.fill();
   const shine = ctx.createRadialGradient(cx - 10, cy - 14, 2, cx, cy, r);
-  shine.addColorStop(0, 'rgba(255,255,255,0.12)');
-  shine.addColorStop(1, 'rgba(0,0,0,0.25)');
+  shine.addColorStop(0, 'rgba(255,255,255,0.16)');
+  shine.addColorStop(1, 'rgba(0,0,0,0.28)');
   ctx.fillStyle = shine;
   ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
   ctx.restore();
-  ctx.strokeStyle = '#8b9099';
-  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = '#c9ced6';
+  ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
   ctx.stroke();
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - 2.5, 0, Math.PI * 2);
+  ctx.stroke();
+
   ctx.textAlign = 'center';
-  ctx.font = `bold 16px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(225,228,234,0.9)';
-  ctx.fillText(label, cx, cy + 5);
+  ctx.font = `bold ${Math.round(r * 0.52)}px ${FONT_GOTHIC}`;
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillText(label, cx + 1, cy + r * 0.16 + 1);
+  ctx.fillStyle = '#f4f5f8';
+  ctx.fillText(label, cx, cy + r * 0.16);
+}
+
+/** A riveted-iron plate — HUD readouts sit on these instead of bare
+ * gameplay pixels, since a translucent stone/fire background is what made
+ * the old grey text hard to read. */
+function drawPlate(ctx: CanvasRenderingContext2D, cx: number, cy: number, w: number, h: number): void {
+  const r = h / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - w / 2 + r, cy - h / 2);
+  ctx.lineTo(cx + w / 2 - r, cy - h / 2);
+  ctx.arc(cx + w / 2 - r, cy, r, -Math.PI / 2, Math.PI / 2);
+  ctx.lineTo(cx - w / 2 + r, cy + h / 2);
+  ctx.arc(cx - w / 2 + r, cy, r, Math.PI / 2, -Math.PI / 2);
+  ctx.closePath();
+  const steel = getUiSteelPattern(ctx);
+  if (steel) {
+    paintMaterial(ctx, steel, 'rgba(8,8,10,0.8)', false);
+  } else {
+    ctx.fillStyle = 'rgba(8,7,9,0.82)';
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(150,156,166,0.4)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+}
+
+/** High-contrast text: a dark offset pass under the pale fill, so it reads
+ * over any background instead of blending into it. */
+function fillTextPop(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, fill = '#f2f3f6'): void {
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillText(text, x + 1.2, y + 1.4);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
+/** Truncates `text` with an ellipsis so it fits `maxWidth` at the context's
+ * current font — used to keep long rolled item names off the satchel's
+ * edge instead of overflowing the panel. */
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ctx.measureText(text.slice(0, mid) + '…').width <= maxWidth) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, lo) + '…';
+}
+
+/** Greedy word-wrap at the context's current font, for tooltip bodies. */
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let cur = '';
+  for (const w of words) {
+    const test = cur ? `${cur} ${w}` : w;
+    if (cur && ctx.measureText(test).width > maxWidth) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = test;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+/** A small plate anchored above a point (e.g. hovering the potion belt),
+ * for the same reason drawPlate exists on the HUD proper: bare text over
+ * moving gameplay pixels is hard to read. */
+function drawTooltipAbove(ctx: CanvasRenderingContext2D, cx: number, bottomY: number, lines: string[]): void {
+  ctx.textAlign = 'center';
+  let maxW = 0;
+  for (const l of lines) {
+    ctx.font = `bold 13px ${FONT_GOTHIC}`;
+    maxW = Math.max(maxW, ctx.measureText(l).width);
+  }
+  const lineH = 18;
+  const boxW = maxW + 26;
+  const boxH = lines.length * lineH + 12;
+  const cy = bottomY - boxH / 2 - 8;
+  drawPlate(ctx, cx, cy, boxW, boxH);
+  const top = cy - boxH / 2 + 16;
+  lines.forEach((l, i) => {
+    ctx.font = i === 0 ? `bold 13px ${FONT_GOTHIC}` : `12px ${FONT_GOTHIC}`;
+    ctx.fillStyle = i === 0 ? '#f0f1f4' : 'rgba(205,211,219,0.8)';
+    ctx.fillText(l, cx, top + i * lineH);
+  });
+}
+
+/** A pill-shaped key hint, e.g. [Q] Potion — returns its width so callers
+ * can lay a row of these out left to right. */
+function drawKeyChip(ctx: CanvasRenderingContext2D, x: number, y: number, key: string, label: string): number {
+  ctx.font = `bold 12px ${FONT_GOTHIC}`;
+  const keyW = ctx.measureText(key).width;
+  ctx.font = `12px ${FONT_GOTHIC}`;
+  const labelW = ctx.measureText(label).width;
+  const padX = 9;
+  const gap = 7;
+  const chipW = padX * 2 + keyW + gap + labelW;
+  const chipH = 23;
+  const r = chipH / 2;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + chipW, y, x + chipW, y + chipH, r);
+  ctx.arcTo(x + chipW, y + chipH, x, y + chipH, r);
+  ctx.arcTo(x, y + chipH, x, y, r);
+  ctx.arcTo(x, y, x + chipW, y, r);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(4,4,6,0.55)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(170,176,186,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.textAlign = 'left';
+  ctx.font = `bold 12px ${FONT_GOTHIC}`;
+  ctx.fillStyle = '#e8ebf0';
+  ctx.fillText(key, x + padX, y + chipH / 2 + 4);
+  ctx.font = `12px ${FONT_GOTHIC}`;
+  ctx.fillStyle = 'rgba(190,196,204,0.78)';
+  ctx.fillText(label, x + padX + keyW + gap, y + chipH / 2 + 4);
+  return chipW;
+}
+
+/** A round steel touch button (satchel/pause) — `active` lights its rim,
+ * for the satchel button while the panel is open. `drawIcon` runs with the
+ * button's fill/stroke already set to a pale steel tone. */
+function drawIconButton(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  active: boolean,
+  drawIcon: () => void,
+): void {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  const steel = getUiSteelPattern(ctx);
+  if (steel) {
+    paintMaterial(ctx, steel, active ? 'rgba(40,70,85,0.6)' : 'rgba(10,10,12,0.78)', false);
+  } else {
+    ctx.fillStyle = active ? '#284252' : '#1c1d21';
+    ctx.fill();
+  }
+  ctx.strokeStyle = active ? 'rgba(159,213,235,0.7)' : 'rgba(200,205,212,0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  drawIcon();
 }
 
 function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   const { w, h } = view;
   const p = game.player;
 
-  drawOrb(ctx, 62, h - 62, 36, p.hp / p.maxHp, '#4d1016', game.time, String(Math.ceil(p.hp)));
-  drawOrb(ctx, w - 62, h - 62, 36, p.mana / p.maxMana, '#173a52', game.time + 3, String(Math.floor(p.mana)));
+  // Sized to use the corner room a 1080p+ window actually has; hudLayout()
+  // shrinks everything on short (phone-landscape) viewports via its scale.
+  const layout = hudLayout(w, h);
+  const { orbR, bezelR, healthCx, manaCx, orbY, scale: s } = layout;
+  drawOrb(ctx, healthCx, orbY, orbR, p.hp / p.maxHp, '#4d1016', game.time, String(Math.ceil(p.hp)));
+  drawOrb(ctx, manaCx, orbY, orbR, p.mana / p.maxMana, '#173a52', game.time + 3, String(Math.floor(p.mana)));
+  if (game.spellArmed) {
+    // A cold pulse around the mana orb while a spell is armed for the next
+    // tap/click on the field — the touch equivalent of right-click-to-cast.
+    const pulse = 0.5 + 0.5 * Math.sin(game.time * 6);
+    ctx.strokeStyle = `rgba(159,213,235,${0.5 + pulse * 0.4})`;
+    ctx.lineWidth = 3 * s;
+    ctx.beginPath();
+    ctx.arc(manaCx, orbY, bezelR + 5 * s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
 
-  // Active spell above the mana orb.
+  // Active spell above the mana orb — hover (or tap the orb) to see its cost.
   ctx.textAlign = 'center';
-  ctx.font = `15px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(200,206,214,0.75)';
-  ctx.fillText(SPELLS[p.spell.spell ?? 'frostnova'].name, w - 62, h - 108);
+  ctx.font = `bold ${17 * s}px ${FONT_GOTHIC}`;
+  const spell = SPELLS[p.spell.spell ?? 'frostnova'];
+  const spellY = orbY - bezelR - 15 * s;
+  fillTextPop(ctx, spell.name, manaCx, spellY);
+  if (Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
+    const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click';
+    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [spell.name, `${spell.cost} mana · ${how} to cast`]);
+  }
 
   // Potion belt beside the health orb.
-  const bx = 122;
-  const by = h - 66;
-  ctx.fillStyle = '#5e1218';
+  const { x: bx, y: by, r: potionR } = layout.potion;
+  ctx.fillStyle = '#6a161c';
   ctx.beginPath();
-  ctx.ellipse(bx, by + 3, 5, 6.5, 0, 0, Math.PI * 2);
+  ctx.ellipse(bx, by + 4 * s, 7 * s, 9 * s, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = '#22252a';
-  ctx.fillRect(bx - 2, by - 9, 4, 6);
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = '#2a2d33';
+  ctx.fillRect(bx - 2.5 * s, by - 12 * s, 5 * s, 8 * s);
   ctx.textAlign = 'left';
-  ctx.font = `bold 17px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(210,215,222,0.85)';
-  ctx.fillText(`× ${p.potions}`, bx + 11, by + 6);
-  ctx.font = '11px Georgia, serif';
-  ctx.fillStyle = 'rgba(170,176,184,0.5)';
-  ctx.fillText('Q', bx - 3, by + 24);
+  ctx.font = `bold ${23 * s}px ${FONT_GOTHIC}`;
+  fillTextPop(ctx, `× ${p.potions}`, bx + 15 * s, by + 8 * s);
+  ctx.font = `bold ${14 * s}px ${FONT_GOTHIC}`;
+  ctx.fillStyle = 'rgba(200,206,214,0.8)';
+  ctx.fillText('Q', bx - 4 * s, by + 30 * s);
+  if (Math.hypot(view.mouseX - bx, view.mouseY - by) < potionR + 4) {
+    drawTooltipAbove(ctx, bx, by - 16 * s, ['Potion', `restores ${POTION_HEAL} HP · Q to quaff`]);
+  }
 
-  // Depth marker.
+  // Depth marker, on an iron plate so it reads over any floor beneath it.
   ctx.textAlign = 'center';
-  ctx.font = `26px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(200,206,214,0.75)';
-  ctx.fillText(`✠ Depth ${roman(game.depth)} ✠`, w / 2, 42);
+  const dmText = `Depth ${roman(game.depth)}`;
+  ctx.font = `bold ${30 * s}px ${FONT_GOTHIC}`;
+  const dmW = ctx.measureText(dmText).width;
+  drawPlate(ctx, w / 2, 40 * s, dmW + 116 * s, 50 * s);
+  drawInvertedCross(ctx, w / 2 - dmW / 2 - 36 * s, 40 * s, 13 * s, 0.85);
+  drawInvertedCross(ctx, w / 2 + dmW / 2 + 36 * s, 40 * s, 13 * s, 0.85);
+  fillTextPop(ctx, dmText, w / 2, 50 * s);
 
   // Boss health bar.
   const boss = game.boss;
   if (boss && boss.aggro) {
-    const bw = w * 0.36;
-    ctx.font = `18px ${FONT_GOTHIC}`;
-    ctx.fillStyle = 'rgba(210,216,224,0.85)';
-    ctx.fillText(boss.name, w / 2, 68);
-    ctx.fillStyle = 'rgba(0,0,0,0.65)';
-    ctx.fillRect(w / 2 - bw / 2, 76, bw, 7);
-    ctx.fillStyle = '#6d1a20';
-    ctx.fillRect(w / 2 - bw / 2, 76, (bw * Math.max(0, boss.hp)) / boss.maxHp, 7);
-    ctx.strokeStyle = 'rgba(139,144,153,0.6)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(w / 2 - bw / 2, 76, bw, 7);
+    const bw = w * 0.4;
+    const by2 = 108 * s;
+    ctx.font = `bold ${22 * s}px ${FONT_GOTHIC}`;
+    fillTextPop(ctx, boss.name, w / 2, by2 - 12 * s);
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(w / 2 - bw / 2, by2, bw, 13 * s);
+    ctx.fillStyle = '#7a1f26';
+    ctx.fillRect(w / 2 - bw / 2, by2, (bw * Math.max(0, boss.hp)) / boss.maxHp, 13 * s);
+    ctx.strokeStyle = 'rgba(210,216,224,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(w / 2 - bw / 2, by2, bw, 13 * s);
   }
 
   // XP bar.
-  const xw = Math.min(420, w * 0.42);
+  const xw = Math.min(520, w * 0.46);
   const xx = w / 2 - xw / 2;
-  const xy = h - 40;
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(xx, xy, xw, 5);
-  ctx.fillStyle = 'rgba(170,179,189,0.8)';
-  ctx.fillRect(xx, xy, (xw * p.xp) / xpNext(p.level), 5);
-  ctx.strokeStyle = 'rgba(139,144,153,0.4)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(xx, xy, xw, 5);
-  ctx.font = `13px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(190,196,204,0.7)';
-  ctx.fillText(`Level ${roman(p.level)}`, w / 2, xy - 6);
+  const xy = h - 46 * s;
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
+  ctx.fillRect(xx, xy, xw, 9 * s);
+  ctx.fillStyle = 'rgba(190,198,210,0.9)';
+  ctx.fillRect(xx, xy, (xw * p.xp) / xpNext(p.level), 9 * s);
+  ctx.strokeStyle = 'rgba(210,216,224,0.55)';
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(xx, xy, xw, 9 * s);
+  ctx.font = `bold ${15 * s}px ${FONT_GOTHIC}`;
+  fillTextPop(ctx, `Level ${roman(p.level)}`, w / 2, xy - 8 * s);
 
-  // Kill count.
-  ctx.textAlign = 'right';
-  ctx.font = `17px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(180,186,194,0.6)';
-  ctx.fillText(`souls reaped  ${game.kills}`, w - 24, h - 24);
+  // Kill count — a small sword badge left of the mana orb (mirrors the
+  // potion belt beside the health orb), instead of text that used to run
+  // into the orb.
+  const kx = layout.killBadge.x;
+  const ky = layout.killBadge.y;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#d8dce2';
+  ctx.lineWidth = 3 * s;
+  ctx.beginPath();
+  ctx.moveTo(kx - 7 * s, ky + 11 * s);
+  ctx.lineTo(kx + 8 * s, ky - 12 * s);
+  ctx.stroke();
+  ctx.strokeStyle = '#9aa1a9';
+  ctx.lineWidth = 2.6 * s;
+  ctx.beginPath();
+  ctx.moveTo(kx - 10 * s, ky + 1 * s);
+  ctx.lineTo(kx - 2 * s, ky + 8 * s);
+  ctx.stroke();
+  ctx.lineCap = 'butt';
+  ctx.fillStyle = '#9aa1a9';
+  ctx.beginPath();
+  ctx.arc(kx - 8 * s, ky + 12 * s, 1.8 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.textAlign = 'left';
+  ctx.font = `bold ${22 * s}px ${FONT_GOTHIC}`;
+  fillTextPop(ctx, `${game.kills}`, kx + 13 * s, ky + 9 * s);
+
+  // Satchel / pause icon buttons — touch only, desktop already has I/Esc.
+  if (isTouchDevice && game.screen === 'playing') {
+    const sb = layout.satchelBtn;
+    drawIconButton(ctx, sb.x, sb.y, sb.r, game.invOpen, () => {
+      const rs = sb.r / 24;
+      ctx.fillStyle = '#c9ced6';
+      ctx.beginPath();
+      ctx.moveTo(sb.x - 7 * rs, sb.y - 3 * rs);
+      ctx.lineTo(sb.x - 6 * rs, sb.y + 7 * rs);
+      ctx.quadraticCurveTo(sb.x, sb.y + 9 * rs, sb.x + 6 * rs, sb.y + 7 * rs);
+      ctx.lineTo(sb.x + 7 * rs, sb.y - 3 * rs);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#3a3d43';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(sb.x - 4 * rs, sb.y - 3 * rs);
+      ctx.quadraticCurveTo(sb.x, sb.y - 7 * rs, sb.x + 4 * rs, sb.y - 3 * rs);
+      ctx.stroke();
+    });
+    const pb = layout.pauseBtn;
+    drawIconButton(ctx, pb.x, pb.y, pb.r, false, () => {
+      const rs = pb.r / 24;
+      ctx.fillStyle = '#c9ced6';
+      ctx.fillRect(pb.x - 6 * rs, pb.y - 8 * rs, 4 * rs, 16 * rs);
+      ctx.fillRect(pb.x + 2 * rs, pb.y - 8 * rs, 4 * rs, 16 * rs);
+    });
+  }
 
   // FPS meter (toggle with P).
   if (game.showFps && view.fps !== undefined) {
@@ -2642,18 +3754,52 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
     ctx.fillText(`${view.fps} fps`, 16, 24);
   }
 
-  // Hint.
-  ctx.textAlign = 'center';
-  ctx.font = '12px Georgia, serif';
-  ctx.fillStyle = 'rgba(170,176,184,0.32)';
-  ctx.fillText('hold click to move · right-click casts your spell · Q quaff · I satchel · M mute', w / 2, h - 16);
+  // Hint chips instead of one dense sentence.
+  const chips: [string, string][] = isTouchDevice
+    ? [
+        ['Hold', 'Move'],
+        ['Tap orb', 'Cast'],
+        ['Belt', 'Potion'],
+      ]
+    : [
+        ['Hold click', 'Move'],
+        ['Right-click', 'Cast'],
+        ['Q', 'Quaff'],
+        ['I', 'Satchel'],
+        ['M', 'Mute'],
+      ];
+  const chipGap = 8;
+  ctx.font = `bold 12px ${FONT_GOTHIC}`;
+  let chipsW = 0;
+  for (const [key, label] of chips) {
+    ctx.font = `bold 12px ${FONT_GOTHIC}`;
+    const kw = ctx.measureText(key).width;
+    ctx.font = `12px ${FONT_GOTHIC}`;
+    chipsW += 9 * 2 + kw + 7 + ctx.measureText(label).width + chipGap;
+  }
+  chipsW -= chipGap;
+  let chipX = w / 2 - chipsW / 2;
+  const chipY = h - 34 * s;
+  for (const [key, label] of chips) {
+    chipX += drawKeyChip(ctx, chipX, chipY, key, label) + chipGap;
+  }
+  ctx.textAlign = 'center'; // drawKeyChip leaves it 'left' — restore the ambient default
 
-  // Enemy nameplate under the cursor.
+  // Enemy nameplate under the cursor, on its own small plate for contrast —
+  // clamped inside the viewport so it can't clip off-screen near an edge.
   if (game.hoverEnemy) {
     const e = game.hoverEnemy;
-    ctx.font = `16px ${FONT_GOTHIC}`;
-    ctx.fillStyle = 'rgba(215,220,228,0.9)';
-    ctx.fillText(`${e.name} — ${Math.max(0, Math.ceil(e.hp))}/${e.maxHp}`, view.mouseX, view.mouseY - 18);
+    const label = `${e.name} — ${Math.max(0, Math.ceil(e.hp))}/${e.maxHp}`;
+    ctx.textAlign = 'center';
+    ctx.font = `bold 17px ${FONT_GOTHIC}`;
+    const lw = ctx.measureText(label).width;
+    const boxW = lw + 20;
+    const boxH = 26;
+    const bx2 = Math.max(8, Math.min(w - 8 - boxW, view.mouseX - boxW / 2));
+    const by2 = Math.max(8, Math.min(h - 8 - boxH, view.mouseY - 38));
+    ctx.fillStyle = 'rgba(6,6,8,0.72)';
+    ctx.fillRect(bx2, by2, boxW, boxH);
+    fillTextPop(ctx, label, bx2 + boxW / 2, by2 + 19);
   }
 
   if (game.invOpen) drawInventory(ctx, game, view);
@@ -2662,8 +3808,10 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   if (game.banner.t > 0) {
     const alpha = Math.min(1, game.banner.t * 0.8);
     ctx.textAlign = 'center';
-    ctx.fillStyle = `rgba(215,221,229,${alpha})`;
-    ctx.font = `64px ${FONT_GOTHIC}`;
+    ctx.fillStyle = `rgba(0,0,0,${alpha * 0.8})`;
+    ctx.font = `bold 66px ${FONT_GOTHIC}`;
+    ctx.fillText(game.banner.text, w / 2 + 2, h * 0.34 + 2);
+    ctx.fillStyle = `rgba(225,229,236,${alpha})`;
     ctx.fillText(game.banner.text, w / 2, h * 0.34);
     if (game.banner.sub) {
       ctx.font = `22px ${FONT_GOTHIC}`;
@@ -2673,60 +3821,138 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   }
 }
 
+// Item-type accent colors, so a satchel row reads at a glance before the
+// text does — reused from the tones already on the player/HUD elsewhere.
+// Diablo-style rarity coloring: undecorated white/gray for a plain drop,
+// blue for a single-affix magic item, gold for a 2-3 affix rare — so the
+// player can tell a good drop apart from junk without reading the tooltip.
+function rarityColor(loot: { rarity?: 'magic' | 'rare' } | 'potion'): string | null {
+  if (loot === 'potion') return null;
+  if (loot.rarity === 'rare') return '#e0b64a';
+  if (loot.rarity === 'magic') return '#6fa8dc';
+  return null;
+}
+
+function itemAccent(loot: { kind: string }): string {
+  switch (loot.kind) {
+    case 'weapon':
+      return '#aab3bd';
+    case 'armor':
+      return '#8f959d';
+    case 'trinket':
+      return '#b98fd9';
+    case 'tome':
+      return '#7fb8dd';
+    default:
+      return '#8b9099';
+  }
+}
+
 function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   const p = game.player;
-  const rect = invPanelRect(view.w, p.inventory.length);
+  const s = hudScale(view.w, view.h);
+  const m = invMetrics(view.w, view.h);
+  const rect = invPanelRect(view.w, view.h, p.inventory.length);
 
-  ctx.fillStyle = 'rgba(8,8,11,0.93)';
-  ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
-  ctx.strokeStyle = 'rgba(139,144,153,0.55)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  // A hide stretched over the frame: leather fill, ragged top edge, jagged
+  // stitched border, inverted-cross corner studs.
+  const ragged = 6 * s;
+  ctx.beginPath();
+  ctx.moveTo(rect.x, rect.y + ragged);
+  const teeth = 10;
+  for (let i = 0; i <= teeth; i++) {
+    const tx = rect.x + (rect.w * i) / teeth;
+    ctx.lineTo(tx, rect.y + (i % 2 === 0 ? 0 : ragged));
+  }
+  ctx.lineTo(rect.x + rect.w, rect.y + rect.h);
+  ctx.lineTo(rect.x, rect.y + rect.h);
+  ctx.closePath();
+  const leather = getUiLeatherPattern(ctx);
+  if (leather) {
+    paintMaterial(ctx, leather, 'rgba(28,10,10,0.82)', false);
+  } else {
+    ctx.fillStyle = 'rgba(14,7,8,0.93)';
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(150,60,60,0.35)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  drawInvertedCross(ctx, rect.x + 16 * s, rect.y + rect.h - 16 * s, 8 * s, 0.4);
+  drawInvertedCross(ctx, rect.x + rect.w - 16 * s, rect.y + rect.h - 16 * s, 8 * s, 0.4);
 
   ctx.textAlign = 'left';
-  ctx.font = `22px ${FONT_GOTHIC}`;
-  ctx.fillStyle = 'rgba(215,220,228,0.9)';
-  ctx.fillText('Satchel', rect.x + INV.pad, rect.y + 30);
+  ctx.font = `bold ${28 * s}px ${FONT_GOTHIC}`;
+  fillTextPop(ctx, 'Satchel', rect.x + m.pad, rect.y + 40 * s);
+  drawInvertedCross(ctx, rect.x + rect.w - 30 * s, rect.y + 32 * s, 11 * s, 0.75);
 
-  ctx.font = '13px Georgia, serif';
-  ctx.fillStyle = 'rgba(185,191,199,0.85)';
-  ctx.fillText(`Blade   ${describeItem(p.weapon)}`, rect.x + INV.pad, rect.y + 56);
-  ctx.fillText(`Armor  ${p.armor ? describeItem(p.armor) : '—'}`, rect.x + INV.pad, rect.y + 74);
-  ctx.fillText(`Charm  ${p.trinket ? describeItem(p.trinket) : '—'}`, rect.x + INV.pad, rect.y + 92);
-  ctx.fillText(`Spell   ${describeItem(p.spell)}`, rect.x + INV.pad, rect.y + 110);
+  ctx.font = `${15 * s}px ${FONT_GOTHIC}`;
+  const stats: [string, string][] = [
+    ['Blade', describeItem(p.weapon)],
+    ['Armor', p.armor ? describeItem(p.armor) : '—'],
+    ['Charm', p.trinket ? describeItem(p.trinket) : '—'],
+    ['Spell', describeItem(p.spell)],
+  ];
+  const equipped: (Item | null)[] = [p.weapon, p.armor, p.trinket, p.spell];
+  const statValueMaxW = rect.w - m.pad * 2 - 62 * s;
+  stats.forEach(([label, value], i) => {
+    const ry = rect.y + 70 * s + i * 22 * s;
+    ctx.fillStyle = 'rgba(220,190,190,0.55)';
+    ctx.fillText(label, rect.x + m.pad, ry);
+    fillTextPop(ctx, fitText(ctx, value, statValueMaxW), rect.x + m.pad + 62 * s, ry, rarityColor(equipped[i] ?? {}) ?? '#eceef2');
+  });
 
-  ctx.strokeStyle = 'rgba(139,144,153,0.3)';
+  // A stitched seam instead of a plain divider.
+  ctx.strokeStyle = 'rgba(210,180,180,0.28)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
   ctx.beginPath();
-  ctx.moveTo(rect.x + INV.pad, rect.y + INV.headerH - 8);
-  ctx.lineTo(rect.x + rect.w - INV.pad, rect.y + INV.headerH - 8);
+  ctx.moveTo(rect.x + m.pad, rect.y + m.headerH - 10 * s);
+  ctx.lineTo(rect.x + rect.w - m.pad, rect.y + m.headerH - 10 * s);
   ctx.stroke();
+  ctx.setLineDash([]);
 
   if (p.inventory.length === 0) {
-    ctx.font = 'italic 13px Georgia, serif';
-    ctx.fillStyle = 'rgba(150,156,164,0.5)';
-    ctx.fillText('nothing but dust', rect.x + INV.pad, rect.y + INV.headerH + 19);
+    ctx.font = `italic ${15 * s}px ${FONT_GOTHIC}`;
+    ctx.fillStyle = 'rgba(190,160,160,0.55)';
+    ctx.fillText('nothing but dust', rect.x + m.pad, rect.y + m.headerH + 22 * s);
     return;
   }
 
   for (let i = 0; i < p.inventory.length; i++) {
-    const ry = rect.y + INV.headerH + i * INV.rowH;
+    const ry = rect.y + m.headerH + i * m.rowH;
     const hovered =
       view.mouseX >= rect.x &&
       view.mouseX <= rect.x + rect.w &&
       view.mouseY >= ry &&
-      view.mouseY < ry + INV.rowH;
+      view.mouseY < ry + m.rowH;
     if (hovered) {
-      ctx.fillStyle = 'rgba(255,255,255,0.07)';
-      ctx.fillRect(rect.x + 2, ry, rect.w - 4, INV.rowH);
+      ctx.fillStyle = 'rgba(140,20,25,0.28)';
+      ctx.fillRect(rect.x + 3, ry, rect.w - 6, m.rowH);
     }
-    ctx.font = '14px Georgia, serif';
-    ctx.fillStyle = 'rgba(205,211,219,0.9)';
-    ctx.fillText(describeItem(p.inventory[i]), rect.x + INV.pad, ry + 20);
+    const loot = p.inventory[i];
+    ctx.fillStyle = rarityColor(loot) ?? itemAccent(loot);
+    ctx.beginPath();
+    ctx.arc(rect.x + m.pad + 3 * s, ry + m.rowH / 2 + 1 * s, 3.5 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = `${16 * s}px ${FONT_GOTHIC}`;
+    // Name only, truncated to fit — the full stat line lives in the hover
+    // tooltip instead of overflowing the panel.
+    const name = loot.name;
+    const nameMaxW = rect.w - m.pad - 16 * s - m.pad - (hovered ? 92 * s : 0);
+    fillTextPop(ctx, fitText(ctx, name, nameMaxW), rect.x + m.pad + 16 * s, ry + 24 * s, rarityColor(loot) ?? '#e4e7ec');
     if (hovered) {
       ctx.textAlign = 'right';
-      ctx.font = 'italic 12px Georgia, serif';
-      ctx.fillStyle = 'rgba(170,176,184,0.6)';
-      ctx.fillText('equip / drop', rect.x + rect.w - INV.pad, ry + 20);
+      ctx.font = `italic bold ${13 * s}px ${FONT_GOTHIC}`;
+      ctx.fillStyle = 'rgba(230,190,190,0.85)';
+      ctx.fillText('equip / drop', rect.x + rect.w - m.pad, ry + 24 * s);
+      ctx.textAlign = 'left';
+
+      const stat = itemStatLine(loot);
+      const tipLines = [name, ...(stat ? wrapText(ctx, stat, 190 * s) : [])];
+      drawTooltipAbove(ctx, rect.x + rect.w / 2, ry, tipLines);
       ctx.textAlign = 'left';
     }
   }

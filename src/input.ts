@@ -1,13 +1,18 @@
 import type { Game } from './game';
-import { screenToTile } from './iso';
-import { getCamOffset } from './render';
-import { initAudio, toggleMute } from './sound';
+import { getCamOffset, screenToWorldTile } from './render';
+import { initAudio, toggleMute, getVolume, setVolume } from './sound';
+import { pauseVolumeLayout } from './ui';
 
 export interface ViewSize {
   w: number;
   h: number;
 }
 
+// Mouse and touch share this one code path via Pointer Events. The only
+// touch-specific branch is "armed spell" (game.spellArmed) — touch has no
+// right-click, so tapping the mana orb arms the spell and the next tap on
+// the field casts it there; see uiClick() in game.ts for the orb/button hit
+// testing that sets spellArmed.
 export class Input {
   mouseX = 0;
   mouseY = 0;
@@ -20,34 +25,54 @@ export class Input {
     private game: Game,
     private view: ViewSize,
   ) {
-    canvas.addEventListener('mousemove', (ev) => {
+    canvas.addEventListener('pointermove', (ev) => {
       this.mouseX = ev.clientX;
       this.mouseY = ev.clientY;
     });
-    canvas.addEventListener('mousedown', (ev) => {
+    canvas.addEventListener('pointerdown', (ev) => {
       initAudio();
       const g = this.game;
       if (g.screen === 'title') {
         if (ev.button === 0) g.titleClick(ev.clientX, ev.clientY, this.view.w, this.view.h);
         return;
       }
+      if (g.screen === 'paused') {
+        if (ev.button !== 0) return;
+        const layout = pauseVolumeLayout(this.view.w, this.view.h);
+        if (Math.hypot(ev.clientX - layout.minus.x, ev.clientY - layout.minus.y) < layout.minus.r) {
+          setVolume(getVolume() - 0.1);
+        } else if (Math.hypot(ev.clientX - layout.plus.x, ev.clientY - layout.plus.y) < layout.plus.r) {
+          setVolume(getVolume() + 0.1);
+        }
+        return;
+      }
       if (g.screen !== 'playing') return;
       if (ev.button === 2) {
-        if (!g.uiRightClick(ev.clientX, ev.clientY, this.view.w)) {
+        if (!g.uiRightClick(ev.clientX, ev.clientY, this.view.w, this.view.h)) {
           const tp = this.mouseTile();
           g.castSpell(tp.x, tp.y);
         }
         return;
       }
       if (ev.button !== 0) return;
-      if (g.uiClick(ev.clientX, ev.clientY, this.view.w)) return;
+      ev.preventDefault();
+      if (g.uiClick(ev.clientX, ev.clientY, this.view.w, this.view.h)) return;
+      if (g.spellArmed) {
+        g.spellArmed = false;
+        const tp = this.mouseTile();
+        g.castSpell(tp.x, tp.y);
+        return;
+      }
       this.held = true;
       this.holdT = 0.15;
       const tp = this.mouseTile();
       g.clickAt(tp.x, tp.y);
     });
-    window.addEventListener('mouseup', (ev) => {
+    window.addEventListener('pointerup', (ev) => {
       if (ev.button === 0) this.held = false;
+    });
+    window.addEventListener('pointercancel', () => {
+      this.held = false;
     });
     canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
     window.addEventListener('keydown', (ev) => {
@@ -68,6 +93,8 @@ export class Input {
       if (g.screen === 'paused') {
         if (k === 'escape') g.togglePause();
         if (k === 't') g.toTitle();
+        if (k === 'arrowup' || k === '+' || k === '=') setVolume(getVolume() + 0.1);
+        if (k === 'arrowdown' || k === '-') setVolume(getVolume() - 0.1);
         return;
       }
       // playing
@@ -98,7 +125,7 @@ export class Input {
 
   private mouseTile(): { x: number; y: number } {
     const { offX, offY } = getCamOffset(this.game, this.view.w, this.view.h);
-    return screenToTile(this.mouseX - offX, this.mouseY - offY);
+    return screenToWorldTile(this.mouseX, this.mouseY, offX, offY, this.view.w, this.view.h);
   }
 
   update(dt: number): void {
