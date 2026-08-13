@@ -615,8 +615,11 @@ export class Game {
     for (const ef of this.effects) ef.t += dt / 0.55;
     this.effects = this.effects.filter((ef) => ef.t < 1);
 
-    // Camera eases toward the player.
-    const ease = Math.min(1, dt * 3.5);
+    // Camera eases toward the player — tight enough that sustained movement
+    // doesn't drag the player off-center (a slower rate left it trailing by
+    // over a tile at full run speed, which ate into reaction time on the
+    // smaller viewports mobile play uses).
+    const ease = Math.min(1, dt * 14);
     this.camX += (this.player.x - this.camX) * ease;
     this.camY += (this.player.y - this.camY) * ease;
 

@@ -43,6 +43,10 @@ export class Input {
           setVolume(getVolume() - 0.1);
         } else if (Math.hypot(ev.clientX - layout.plus.x, ev.clientY - layout.plus.y) < layout.plus.r) {
           setVolume(getVolume() + 0.1);
+        } else {
+          // Touch has no Esc key — tapping anywhere else on the pause
+          // screen resumes, same as the volume buttons do the opposite job.
+          g.togglePause();
         }
         return;
       }

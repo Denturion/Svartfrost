@@ -57,6 +57,11 @@ export function getCamOffset(game: Game, w: number, h: number): { offX: number; 
   };
 }
 
+// Touch play happens on much smaller viewports, where the desktop zoom
+// level shows too little of the surrounding room to see enemies coming —
+// pull back slightly so mobile isn't as claustrophobic.
+const VIEW_ZOOM = isTouchDevice ? 1.15 : ZOOM;
+
 /** Inverts the render loop's zoom-about-center transform, so screen-space
  * mouse coordinates land on the same tile the player sees under the cursor. */
 export function screenToWorldTile(
@@ -67,8 +72,8 @@ export function screenToWorldTile(
   w: number,
   h: number,
 ): { x: number; y: number } {
-  const wx = w / 2 + (mouseX - w / 2) / ZOOM;
-  const wy = h / 2 + (mouseY - h / 2) / ZOOM;
+  const wx = w / 2 + (mouseX - w / 2) / VIEW_ZOOM;
+  const wy = h / 2 + (mouseY - h / 2) / VIEW_ZOOM;
   return screenToTile(wx - offX, wy - offY);
 }
 
@@ -1324,15 +1329,27 @@ function makePattern(ctx: CanvasRenderingContext2D, img: HTMLImageElement, scale
   return p;
 }
 
+// Pattern-fill + multiply-tint (paintMaterial) is the single most expensive
+// thing drawn per entity, and it's redone every frame for every visible
+// body — cheap enough on desktop even with 20+ enemies on screen, but
+// costly enough on mobile GPUs to be the dominant cause of "laggy on
+// mobile" once several enemies are in view at once. Rather than touching
+// every draw call site, the three per-entity getters return null on touch
+// devices so every caller's existing flat-fill fallback (written for the
+// "texture not loaded yet" case) takes over automatically — same
+// silhouettes, no pattern sampling or multiply blending per shape.
 function getClothPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (isTouchDevice) return null;
   if (!clothPattern && playerTexturesReady()) clothPattern = makePattern(ctx, playerClothImg);
   return clothPattern;
 }
 function getSkinPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (isTouchDevice) return null;
   if (!skinPattern && playerTexturesReady()) skinPattern = makePattern(ctx, playerSkinImg);
   return skinPattern;
 }
 function getSteelPattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+  if (isTouchDevice) return null;
   if (!steelPattern && playerTexturesReady()) steelPattern = makePattern(ctx, playerSteelImg);
   return steelPattern;
 }
@@ -2848,7 +2865,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
   // mirrors this so mouse targeting still lines up.
   ctx.save();
   ctx.translate(w / 2, h / 2);
-  ctx.scale(ZOOM, ZOOM);
+  ctx.scale(VIEW_ZOOM, VIEW_ZOOM);
   ctx.translate(-w / 2, -h / 2);
 
   // Cached dim world, then live torchlit region on top.
@@ -3332,9 +3349,15 @@ function drawPause(ctx: CanvasRenderingContext2D, view: View): void {
   ctx.fillText('Paused', w / 2, h * 0.42);
   ctx.font = `18px ${FONT_GOTHIC}`;
   ctx.fillStyle = 'rgba(180,186,196,0.8)';
-  ctx.fillText('Esc — return to the dark', w / 2, h * 0.42 + 46);
-  ctx.fillText('T — abandon to the title (run kept at last depth)', w / 2, h * 0.42 + 74);
-  ctx.fillText('M — mute', w / 2, h * 0.42 + 102);
+  ctx.fillText(
+    isTouchDevice ? 'Tap anywhere — return to the dark' : 'Esc — return to the dark',
+    w / 2,
+    h * 0.42 + 46,
+  );
+  if (!isTouchDevice) {
+    ctx.fillText('T — abandon to the title (run kept at last depth)', w / 2, h * 0.42 + 74);
+    ctx.fillText('M — mute', w / 2, h * 0.42 + 102);
+  }
 
   // Volume control.
   const vol = getVolume();
