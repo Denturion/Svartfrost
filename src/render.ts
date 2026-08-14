@@ -295,18 +295,6 @@ function getFloorTexLevels(x: number, y: number, ao: number): HTMLCanvasElement[
   diamond(cctx, rpx, rpy);
   cctx.fill();
   cctx.globalCompositeOperation = 'source-over';
-  // A blitted tile's edge, even fully opaque, still shows a faint fringe
-  // once nearest-neighbor stretched by the view zoom — a thin dark stroke
-  // over the same outline covers what's left. Baked in here (once per
-  // tile) rather than stroked live every frame: the live version cost as
-  // much as the rest of the frame combined (~26ms in a 34-enemy stress
-  // scene) for what a stroke() call "should" cost, apparently the
-  // per-call overhead adds up fast at a few hundred tiles/frame; baking it
-  // once removes that entirely from the hot path.
-  diamond(cctx, rpx, rpy);
-  cctx.strokeStyle = 'rgba(4,5,8,0.5)';
-  cctx.lineWidth = 1;
-  cctx.stroke();
   levels = bakeBrightnessLevels(c);
   floorTexCache.set(key, levels);
   return levels;
@@ -433,19 +421,6 @@ function getWallTexLevels(ws: WallStyle): HTMLCanvasElement[] {
   // position, fixed color stops) — baked in here. Only the flame itself
   // flickers, so that stays live (see drawSconceFlame in drawWallBlock).
   if (refWs.torch) drawSconceBase(cctx, refWs, hgt);
-
-  // A blitted tile's edge, even fully opaque, still shows a faint fringe
-  // once nearest-neighbor stretched by the view zoom — a thin dark stroke
-  // over the same outline covers what's left. Baked in here (once per
-  // tile) rather than stroked live every frame: the live version cost as
-  // much as the rest of the frame combined (~26ms in a 34-enemy stress
-  // scene) for what a stroke() call "should" cost — baking it once
-  // removes that entirely from the hot path.
-  cctx.beginPath();
-  wallOutlinePath(cctx, refWs);
-  cctx.strokeStyle = 'rgba(4,5,8,0.5)';
-  cctx.lineWidth = 1;
-  cctx.stroke();
 
   levels = bakeBrightnessLevels(c);
   wallTexCache.set(key, levels);
@@ -801,29 +776,6 @@ function drawWallFaceBase(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
   ctx.lineTo(eX, eY);
   ctx.closePath();
   ctx.fill();
-}
-
-/** Adds the SW quad + SE quad + top-slab quad to the current path, without
- * filling/stroking — used to trace a blitted wall tile's whole silhouette
- * in one stroke to cover the faint zoom-scaling fringe at its edge. */
-function wallOutlinePath(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
-  const { px, py } = ws;
-  const { nX, nY, eX, eY, sX, sY, wX, wY } = wallCorners(ws);
-  ctx.moveTo(px - HW, py + HH);
-  ctx.lineTo(px, py + TILE_H);
-  ctx.lineTo(sX, sY);
-  ctx.lineTo(wX, wY);
-  ctx.closePath();
-  ctx.moveTo(px + HW, py + HH);
-  ctx.lineTo(px, py + TILE_H);
-  ctx.lineTo(sX, sY);
-  ctx.lineTo(eX, eY);
-  ctx.closePath();
-  ctx.moveTo(nX, nY);
-  ctx.lineTo(eX, eY);
-  ctx.lineTo(sX, sY);
-  ctx.lineTo(wX, wY);
-  ctx.closePath();
 }
 
 // Everything about a wall tile that isn't the photo warp itself: masonry
