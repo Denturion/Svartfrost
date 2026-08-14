@@ -39,6 +39,88 @@ for a chunky 90s look, rather than being painted on as flat sprites.
 - Procedural WebAudio soundtrack that shifts mood every five depths
 - Save/continue with checkpoints at each depth, plus lifetime records
 
+## Rendering & performance
+
+An audit of how the renderer works, kept up to date as the basis for future
+optimization work rather than re-discovering it every time. References:
+[web.dev canvas performance](https://web.dev/articles/canvas-performance),
+[MDN: optimizing canvas](https://developer.mozilla.org/en-US/docs/Web/API/Canvas_API/Tutorial/Optimizing_canvas),
+[MDN: requestAnimationFrame](https://developer.mozilla.org/en-US/docs/Web/API/window/requestAnimationFrame).
+
+- **Loop:** a single `requestAnimationFrame` loop in `main.ts` drives
+  `input.update` → `game.update(dt)` → `render(ctx, game, view, dt)`, with
+  `dt` clamped to 0.05s. No fixed-timestep/accumulator — one update and one
+  render per rAF tick, so simulation rate is tied to display rate.
+- **Canvas setup:** one 2D context, `alpha: false`. `devicePixelRatio` is
+  capped at 2 and applied via `ctx.setTransform`, so canvas backing size can
+  be up to 4x the CSS pixel area on a high-DPR phone.
+- **World transform:** the whole scene is scaled about the screen center
+  each frame (`ctx.scale(VIEW_ZOOM, VIEW_ZOOM)`, 1.4 desktop / 1.15 touch);
+  `screenToWorldTile()` inverts the same math for hit-testing.
+- **Explored-but-dark tiles:** baked once onto a persistent offscreen
+  `staticCanvas` sized to the whole dungeon, blitted with a single
+  `drawImage` every frame. Newly explored tiles are appended incrementally
+  (tracked via a `Uint8Array` "already baked" mask) and only re-baked at
+  most every 500ms, not every frame.
+- **Torchlit tiles near the player** (a 27x27 tile window, `DYNAMIC_RANGE
+  = 13`, Chebyshev distance) are where almost all of the per-frame cost
+  used to live, and where the current optimization pass focused:
+  - Every visible floor and wall tile's **entire static look** — the
+    photo-texture warp, masonry variant bands, mortar joints, carved
+    runes, bone niches, water stains, ambient occlusion wedges, cracks,
+    rubble, frost rime/icicles, a torch sconce's glow + bracket — is baked
+    **once** into a small offscreen canvas per tile (`floorTexCache` /
+    `wallTexCache`, keyed by `x,y`) at a reference brightness. The only
+    thing that changes frame to frame (light level, from torch flicker and
+    the player's own glow) is applied live as a *single* combined
+    multiply-tint fill over the tile's blitted silhouette
+    (`wallShapePath` + `tintPath`), instead of the ~10-20 separate
+    `beginPath`/`fill`/`stroke` calls that used to run per tile, per
+    frame. The one thing that's genuinely live per-frame is a torch's
+    flickering flame (`drawSconceFlame`, two cheap path fills, no
+    gradient) and the stairwell's pulse ring — everything else is a blit.
+  - **Measured effect:** a synthetic stress scene (34 enemies clustered
+    around the player, forcing a full dynamic-range redraw every frame)
+    went from **87.7ms/frame to 42.9ms/frame** for `render()` alone — roughly
+    a 2x speedup — measured by diffing against the pre-optimization code
+    via `git stash` in the same running page. A more realistic 6-enemy
+    scene renders in ~22ms.
+- **Depth-sorted draw list:** walls, enemies, and the player used to be
+  pushed into a fresh array of ~100-200 arrow-function closures every
+  frame just to defer drawing until after a depth sort. That's now a
+  reused pool of plain tagged slots (`drawPool` in `render.ts`) filled in
+  place each frame, sorted with a manual insertion sort over just the
+  live prefix (the list arrives already close to depth order — walls are
+  pushed in roughly that order from the tile scan — which is insertion
+  sort's best case, and it avoids slicing a fresh array the way
+  `Array#sort` on a sub-range would require).
+- **Entities (player/enemies/bosses):** still no sprites — every body is a
+  hand-drawn vector silhouette (`beginPath` + `lineTo`/`quadraticCurveTo`
+  chains) rebuilt from scratch every frame for every visible entity, with
+  cloth/skin/steel rendered as a repeating `CanvasPattern` from a photo
+  swatch, multiply-tinted to match torchlight. Pattern fills are disabled
+  entirely on touch devices (`isTouchDevice`) as a mobile perf mitigation
+  landed earlier. **Not yet optimized** — tile rendering was the dominant
+  cost (hundreds of tiles vs. a handful of entities on screen at once), so
+  this was left as documented future work rather than tackled now.
+- **Gradients:** the torch sconce's glow is now baked (see above). The
+  remaining `createRadialGradient` call sites (ground-item glow, hazard
+  wash, eye glow, projectile glow, player cloak shading) are still built
+  fresh every frame — deliberately left alone, since their position or
+  pulsing size/alpha changes every frame anyway, so caching the gradient
+  object wouldn't avoid rebuilding it, and their on-screen count is low
+  (a handful at once) compared to tile counts. The vignette is baked once
+  per canvas size and reused; film grain regenerates on a 90ms throttle
+  (not every frame) via `putImageData` onto a small tile, then
+  pattern-repeated.
+- **No `shadowBlur` usage anywhere** in the codebase (already avoided).
+- **Integer blit coordinates:** the three hottest `drawImage` calls
+  (static-world blit, per-tile floor/wall cache blits) round their
+  destination coordinates to avoid forcing sub-pixel antialiasing on a
+  plain sprite blit.
+- **No dirty-rect tracking, no layered canvases, no worker/offscreen
+  rendering** — one canvas, one context.
+
 ## Development
 
 ```sh

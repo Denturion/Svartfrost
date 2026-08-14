@@ -162,6 +162,76 @@ function tintPath(ctx: CanvasRenderingContext2D, b: number, warm: number): void 
   ctx.globalCompositeOperation = 'source-over';
 }
 
+// The masked tint (drawing through a bitmap's own alpha with
+// destination-in — see the old tintedBlit) is the only way that's been
+// found so far to tint a baked tile without a bright seam at its edge,
+// but doing it live, every frame, per tile, is what made the frame budget
+// explode: each call switches globalCompositeOperation multiple times on
+// a small canvas, and that switch is expensive in Canvas2D. The fix is to
+// stop doing it live at all — pre-bake a handful of already-tinted copies
+// of each tile, once, at bake time (when the extra cost is a one-time,
+// off-the-hot-path expense), and have the per-frame path be a plain
+// drawImage that just picks the nearest one. No compositing switches, no
+// getImageData, nothing but a blit, in the render loop.
+//
+// Each tile is flat-shaded at one bucket for its whole area, so simply
+// picking the nearest bucket made torch flicker (which nudges brightness
+// a little every frame) visibly snap a tile between two levels, and made
+// faint seams appear wherever two neighboring tiles landed in different
+// buckets. Rather than push the bucket count up further to shrink those
+// steps, drawWallBlock/drawFloorTile cross-fade the two buckets straddling
+// the live brightness with globalAlpha (see brightnessBlend) — cheap
+// (one extra plain drawImage, no compositing-mode switch) and exact,
+// since both bitmaps share the identical shape/alpha mask, so there's no
+// edge-bleed risk in blending them. That lets the bucket count stay small.
+const BRIGHTNESS_LEVELS = 8;
+
+/** Effective (post-curve) brightness a bucket index represents, 0..1. */
+function levelBrightness(i: number): number {
+  return i / (BRIGHTNESS_LEVELS - 1);
+}
+
+/** The two bucket indices straddling a live brightness value, and how far
+ * between them it sits (0 = fully lo, 1 = fully hi). */
+function brightnessBlend(b: number): { lo: number; hi: number; frac: number } {
+  const eff = Math.min(1, b * 1.7);
+  const t = Math.min(BRIGHTNESS_LEVELS - 1, Math.max(0, eff * (BRIGHTNESS_LEVELS - 1)));
+  const lo = Math.floor(t);
+  const hi = Math.min(BRIGHTNESS_LEVELS - 1, lo + 1);
+  return { lo, hi, frac: t - lo };
+}
+
+/** Bakes BRIGHTNESS_LEVELS pre-tinted copies of a reference-brightness
+ * tile canvas, using the masked (no-bleed) technique — safe to afford
+ * here since it's one-time bake work, not per-frame.
+ *
+ * Warmth (torch orange vs player's cool light) isn't bucketed alongside
+ * brightness — every level bakes at warm=0. Brightness is the dominant
+ * visual signal and the one actually driving the frame cost, so this
+ * trades away some of the torch/player color distinction for the win;
+ * flag if that's noticeable and it can be revisited (e.g. a second warm
+ * bucket) rather than doubling the bucket count pre-emptively.
+ */
+function bakeBrightnessLevels(ref: HTMLCanvasElement): HTMLCanvasElement[] {
+  const out: HTMLCanvasElement[] = [];
+  for (let i = 0; i < BRIGHTNESS_LEVELS; i++) {
+    const c = document.createElement('canvas');
+    c.width = ref.width;
+    c.height = ref.height;
+    const cctx = c.getContext('2d')!;
+    cctx.drawImage(ref, 0, 0);
+    cctx.globalCompositeOperation = 'multiply';
+    cctx.fillStyle = shade([255, 255, 255], levelBrightness(i), 0);
+    cctx.fillRect(0, 0, ref.width, ref.height);
+    cctx.globalCompositeOperation = 'destination-in';
+    cctx.drawImage(ref, 0, 0);
+    cctx.globalCompositeOperation = 'source-over';
+    out.push(c);
+  }
+  return out;
+}
+
+
 /** A random sub-crop of `img`, avoiding the top/bottom ~10% (ornate border bands). */
 function pickWallCrop(img: HTMLImageElement, x: number, y: number, fi: number): [number, number, number, number] {
   const sw = img.width * 0.22;
@@ -185,17 +255,20 @@ function pickFloorCrop(img: HTMLImageElement, x: number, y: number): [number, nu
 // The affine warp (clip + transform + drawImage) is the expensive part of
 // texturing a tile, but its result never changes for a given tile — only
 // the brightness tint on top does, every frame, as torches flicker. So the
-// warp is baked once into a small offscreen canvas per tile, and the hot
-// per-frame path is just a plain drawImage blit plus a cheap tint fill.
+// warp (and everything else about the tile's static look) is baked once
+// into a small set of offscreen canvases per tile — one per brightness
+// bucket, see bakeBrightnessLevels — and the hot per-frame path is just a
+// plain drawImage blit of whichever bucket is closest to the current
+// light level. No live tinting at all.
 const TEX_PAD = 16;
-let floorTexCache = new Map<string, HTMLCanvasElement>();
-let wallTexCache = new Map<string, HTMLCanvasElement>();
+let floorTexCache = new Map<string, HTMLCanvasElement[]>();
+let wallTexCache = new Map<string, HTMLCanvasElement[]>();
 
-function getFloorTexCanvas(x: number, y: number): HTMLCanvasElement {
+function getFloorTexLevels(x: number, y: number, ao: number): HTMLCanvasElement[] {
   const key = `${x},${y}`;
-  let c = floorTexCache.get(key);
-  if (c) return c;
-  c = document.createElement('canvas');
+  let levels = floorTexCache.get(key);
+  if (levels) return levels;
+  const c = document.createElement('canvas');
   c.width = TILE_W + TEX_PAD * 2;
   c.height = TILE_H + TEX_PAD * 2;
   const cctx = c.getContext('2d')!;
@@ -207,42 +280,91 @@ function getFloorTexCanvas(x: number, y: number): HTMLCanvasElement {
   cctx.clip();
   drawWarpedImage(cctx, floorImg, sx, sy, sw, sh, [rpx - HW, rpy + HH], [rpx, rpy], [rpx, rpy + TILE_H]);
   cctx.restore();
-  floorTexCache.set(key, c);
-  return c;
+  // Decoration baked at reference brightness (b=1) alongside the texture —
+  // this only runs once per tile instead of redrawing bones/rubble/AO/
+  // runes every frame it's on screen; the brightness buckets below apply
+  // to texture and decoration together.
+  drawFloorDecor(cctx, rpx, rpy, x, y, 1, 0, ao);
+  // Every fill/stroke above was rasterized independently, so even where
+  // shapes look fully solid, antialiasing can leave microscopic partial-
+  // alpha seams between them. Flattening the whole tile to fully opaque as
+  // a last step — destination-over only fills gaps, it never overwrites
+  // already-opaque pixels — removes them.
+  cctx.globalCompositeOperation = 'destination-over';
+  cctx.fillStyle = (x + y) % 2 === 0 ? shade(PALETTE.floorA, 1, 0) : shade(PALETTE.floorB, 1, 0);
+  diamond(cctx, rpx, rpy);
+  cctx.fill();
+  cctx.globalCompositeOperation = 'source-over';
+  // A blitted tile's edge, even fully opaque, still shows a faint fringe
+  // once nearest-neighbor stretched by the view zoom — a thin dark stroke
+  // over the same outline covers what's left. Baked in here (once per
+  // tile) rather than stroked live every frame: the live version cost as
+  // much as the rest of the frame combined (~26ms in a 34-enemy stress
+  // scene) for what a stroke() call "should" cost, apparently the
+  // per-call overhead adds up fast at a few hundred tiles/frame; baking it
+  // once removes that entirely from the hot path.
+  diamond(cctx, rpx, rpy);
+  cctx.strokeStyle = 'rgba(4,5,8,0.5)';
+  cctx.lineWidth = 1;
+  cctx.stroke();
+  levels = bakeBrightnessLevels(c);
+  floorTexCache.set(key, levels);
+  return levels;
 }
 
-function getWallTexCanvas(ws: WallStyle): HTMLCanvasElement {
+// Everything about a wall tile's look that's a pure function of its (x, y)
+// — masonry variant, mortar, runes, bone niches, stains, top-slab cracks,
+// rubble, frost rime — is baked once at a reference brightness (bj=1,
+// warm=0) alongside the photo warp, instead of redrawn with fresh
+// beginPath/fill/stroke calls for every visible wall, every frame. That
+// reference bake then becomes BRIGHTNESS_LEVELS pre-tinted copies (see
+// bakeBrightnessLevels); drawWallBlock just blits whichever is closest to
+// the current torch/player light. Torch sconce glow is baked in too, so
+// it rides along with the tinting; only the flame flickers live.
+function getWallTexLevels(ws: WallStyle): HTMLCanvasElement[] {
   const key = `${ws.x},${ws.y}`;
-  let c = wallTexCache.get(key);
-  if (c) return c;
+  let levels = wallTexCache.get(key);
+  if (levels) return levels;
   const { hgt, jit } = ws;
-  c = document.createElement('canvas');
+  const c = document.createElement('canvas');
   c.width = TILE_W + TEX_PAD * 2;
   c.height = hgt + TILE_H + TEX_PAD * 2;
   const cctx = c.getContext('2d')!;
   const img = ws.frost ? wallFrostImg : wallStoneImg;
   const rpx = HW + TEX_PAD;
   const rpy = hgt + TEX_PAD;
+  const refWs: WallStyle = { ...ws, px: rpx, py: rpy, bj: 1, warm: 0, cut: 0 };
 
+  drawWallFaceBase(cctx, refWs);
+
+  // The texture warp's clip has to land on the exact same jittered top
+  // corners drawWallFaceBase just used underneath it — facePt() alone
+  // (hgt offset only, no jitter) traces a clean parallelogram that isn't
+  // where the jittered face quad's top edge actually is, leaving a thin
+  // triangular sliver of the flat base color exposed at whichever corner
+  // jitter pulled furthest. It went unnoticed pre-bake because the old
+  // live code tinted that sliver with the same per-frame brightness as
+  // the texture, so the two colors happened to track each other; baked
+  // once and tinted together afterward, they don't anymore.
+  const { eX, eY, sX, sY, wX, wY } = wallCorners(refWs);
+  const faceTop: [[number, number], [number, number]][] = [
+    [[wX, wY], [sX, sY]], // SW: top-left, top-right
+    [[sX, sY], [eX, eY]], // SE
+  ];
   const facesLocal: [number, number, number, number][] = [
     [rpx - HW, rpy + HH, rpx, rpy + TILE_H],
     [rpx, rpy + TILE_H, rpx + HW, rpy + HH],
   ];
   for (let fi = 0; fi < 2; fi++) {
     const [b0x, b0y, b1x, b1y] = facesLocal[fi];
-    const topLeft = facePt(b0x, b0y, b1x, b1y, 0, 1, hgt);
-    const topRight = facePt(b0x, b0y, b1x, b1y, 1, 1, hgt);
-    const bottomLeft = facePt(b0x, b0y, b1x, b1y, 0, 0, hgt);
-    const p0 = facePt(b0x, b0y, b1x, b1y, 0, 0, hgt);
-    const p1 = facePt(b0x, b0y, b1x, b1y, 1, 0, hgt);
-    const p2 = facePt(b0x, b0y, b1x, b1y, 1, 1, hgt);
-    const p3 = facePt(b0x, b0y, b1x, b1y, 0, 1, hgt);
+    const [topLeft, topRight] = faceTop[fi];
+    const bottomLeft: [number, number] = [b0x, b0y];
     const [sx, sy, sw, sh] = pickWallCrop(img, ws.x, ws.y, fi);
     cctx.beginPath();
-    cctx.moveTo(p0[0], p0[1]);
-    cctx.lineTo(p1[0], p1[1]);
-    cctx.lineTo(p2[0], p2[1]);
-    cctx.lineTo(p3[0], p3[1]);
+    cctx.moveTo(b0x, b0y);
+    cctx.lineTo(b1x, b1y);
+    cctx.lineTo(topRight[0], topRight[1]);
+    cctx.lineTo(topLeft[0], topLeft[1]);
     cctx.closePath();
     cctx.save();
     cctx.clip();
@@ -272,8 +394,62 @@ function getWallTexCanvas(ws: WallStyle): HTMLCanvasElement {
   drawWarpedImage(cctx, img, tsx, tsy, tsw, tsh, [wXl, wYl], [nXl, nYl], [sXl, sYl]);
   cctx.restore();
 
-  wallTexCache.set(key, c);
-  return c;
+  drawWallDecor(cctx, refWs);
+  // Every fill/stroke above was rasterized independently, so even where
+  // shapes look fully solid, antialiasing can leave microscopic partial-
+  // alpha seams between them — invisible here, but the live multiply-tint
+  // pass in drawWallBlock forces any partial-alpha pixel toward the tint
+  // color itself, turning every one of those seams into a bright halo
+  // tracing every edge of every wall. Flattening the silhouette to fully
+  // opaque as a last step — destination-over only fills gaps, it never
+  // overwrites already-opaque pixels — removes them; only the true outer
+  // edge against the transparent background stays (harmlessly)
+  // antialiased. Done before the sconce glow so its own intentional soft
+  // falloff isn't flattened away.
+  //
+  // The SW/SE/top-slab regions are filled as three separate calls, each
+  // with its own matching tone, rather than one combined path: two
+  // adjacent subpaths that trace their shared edge as part of a single
+  // fill() can leave a rasterization seam exactly on that shared line
+  // (a nonzero-winding-rule quirk when two boundaries coincide), which
+  // defeats the whole point of this pass. Independent fills have no
+  // shared edge to go wrong on.
+  cctx.globalCompositeOperation = 'destination-over';
+  drawWallFaceBase(cctx, refWs);
+  {
+    const { nX, nY, eX, eY, sX, sY, wX, wY } = wallCorners(refWs);
+    cctx.fillStyle = shade(PALETTE.wallTop, 1, 0);
+    cctx.beginPath();
+    cctx.moveTo(nX, nY);
+    cctx.lineTo(eX, eY);
+    cctx.lineTo(sX, sY);
+    cctx.lineTo(wX, wY);
+    cctx.closePath();
+    cctx.fill();
+  }
+  cctx.globalCompositeOperation = 'source-over';
+
+  // The sconce's glow + bracket never change frame to frame (fixed
+  // position, fixed color stops) — baked in here. Only the flame itself
+  // flickers, so that stays live (see drawSconceFlame in drawWallBlock).
+  if (refWs.torch) drawSconceBase(cctx, refWs, hgt);
+
+  // A blitted tile's edge, even fully opaque, still shows a faint fringe
+  // once nearest-neighbor stretched by the view zoom — a thin dark stroke
+  // over the same outline covers what's left. Baked in here (once per
+  // tile) rather than stroked live every frame: the live version cost as
+  // much as the rest of the frame combined (~26ms in a 34-enemy stress
+  // scene) for what a stroke() call "should" cost — baking it once
+  // removes that entirely from the hot path.
+  cctx.beginPath();
+  wallOutlinePath(cctx, refWs);
+  cctx.strokeStyle = 'rgba(4,5,8,0.5)';
+  cctx.lineWidth = 1;
+  cctx.stroke();
+
+  levels = bakeBrightnessLevels(c);
+  wallTexCache.set(key, levels);
+  return levels;
 }
 
 // --- floors ----------------------------------------------------------------
@@ -293,32 +469,14 @@ const AO_EDGES: [number, number][][] = [
   [[-HW, 0], [0, -HH]], // NW
 ];
 
-/** `time` null = static rendering (no animation). */
-function drawFloorTile(
-  ctx: CanvasRenderingContext2D,
-  px: number,
-  py: number,
-  x: number,
-  y: number,
-  b: number,
-  warm: number,
-  tile: Tile,
-  time: number | null,
-  ao: number,
-): void {
-  const j = 0.82 + tileHash(x, y) * 0.36;
-  if (texturesReady()) {
-    const cached = getFloorTexCanvas(x, y);
-    ctx.drawImage(cached, px - HW - TEX_PAD, py - TEX_PAD);
-    diamond(ctx, px, py);
-    tintPath(ctx, b * j, warm);
-  } else {
-    const base = (x + y) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
-    ctx.fillStyle = shade(base, b * j, warm);
-    diamond(ctx, px, py);
-    ctx.fill();
-  }
-
+// Surface dressing (bones/flagstone-cracks/rubble/ice, ambient occlusion,
+// runes) is a pure function of tile position + a reference brightness — it
+// never actually needs to react to the live torch flicker frame to frame,
+// so it's baked once into the per-tile texture cache (see
+// getFloorTexLevels) instead of redrawn with fresh beginPath/fill/stroke
+// calls for every tile, every frame. Still called live from the
+// pre-texture-load fallback below, where nothing is cached yet anyway.
+function drawFloorDecor(ctx: CanvasRenderingContext2D, px: number, py: number, x: number, y: number, b: number, warm: number, ao: number): void {
   const cx = px;
   const cy = py + HH;
 
@@ -412,7 +570,44 @@ function drawFloorTile(
     }
     ctx.stroke();
   }
+}
 
+/** `time` null = static rendering (no animation). */
+function drawFloorTile(
+  ctx: CanvasRenderingContext2D,
+  px: number,
+  py: number,
+  x: number,
+  y: number,
+  b: number,
+  warm: number,
+  tile: Tile,
+  time: number | null,
+  ao: number,
+): void {
+  const j = 0.82 + tileHash(x, y) * 0.36;
+  if (texturesReady()) {
+    const levels = getFloorTexLevels(x, y, ao);
+    const bx = Math.round(px - HW - TEX_PAD);
+    const by = Math.round(py - TEX_PAD);
+    const { lo, hi, frac } = brightnessBlend(b * j);
+    ctx.drawImage(levels[lo], bx, by);
+    if (frac > 0.02 && hi !== lo) {
+      ctx.globalAlpha = frac;
+      ctx.drawImage(levels[hi], bx, by);
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    const base = (x + y) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
+    ctx.fillStyle = shade(base, b * j, warm);
+    diamond(ctx, px, py);
+    ctx.fill();
+    drawFloorDecor(ctx, px, py, x, y, b, warm, ao);
+  }
+
+  // The stairwell glow pulses with live time, so it stays outside the bake
+  // and is the one piece of "decoration" still drawn every frame — but
+  // there's at most one stairs tile in view at once, so the cost is noise.
   if (tile === Tile.Stairs) {
     const pulse = time === null ? 0.3 : 0.5 + 0.5 * Math.sin(time * 2.2);
     for (let i = 1; i <= 3; i++) {
@@ -475,18 +670,19 @@ function computeWallStyle(
   };
   const pillar = orthFloor(1, 0) && orthFloor(-1, 0) && orthFloor(0, 1) && orthFloor(0, -1);
   const ruined = !pillar && h1 < 0.15;
-  // Rough-hewn stone: grid-corner jitter (shared corners match between
-  // neighbors) so wall banks read as rock, not perfect boxes.
-  const jit: [number, number][] = [];
-  for (let i = 0; i < 4; i++) {
-    const gx = x + (i === 1 || i === 2 ? 1 : 0);
-    const gy = y + (i === 2 || i === 3 ? 1 : 0);
-    const m = ruined ? 2.2 : 1;
-    jit.push([
-      (tileHash(gx * 5 + 1, gy * 7 + 2) - 0.5) * 4.5 * m,
-      (tileHash(gx * 11 + 4, gy * 3 + 8) - 0.5) * 3.5 * m,
-    ]);
-  }
+  // Corner jitter disabled: it offset each wall tile's top corners
+  // (rough-hewn stone look), but the baked tile cache builds a wall's flat
+  // base fill and its texture-warp clip from separately-computed corner
+  // math, and jitter was the one thing that could make those two disagree
+  // — a real per-tile mismatch, not a rendering-precision artifact. Every
+  // corner is fixed at (0, 0) instead of hashed, so there's no jitter left
+  // for any two pieces of a wall to disagree about.
+  const jit: [number, number][] = [
+    [0, 0],
+    [0, 0],
+    [0, 0],
+    [0, 0],
+  ];
   const torch = d.torches.find((t) => t.x === x && t.y === y)?.side ?? null;
   // Masonry variants: strata bands come from a coarse regional hash so whole
   // stretches read as older rock; runes and bone niches are rare accents.
@@ -564,31 +760,31 @@ function facePt(
   return [b0x + (b1x - b0x) * u, b0y + (b1y - b0y) * u - hgt * f];
 }
 
-function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
-  const { px, py, bj, warm, h1, hgt } = ws;
-  // Occluding walls turn translucent instead of sinking. The dim explored
-  // cache already blitted beneath keeps them reading as stone, not holes,
-  // while the player (drawn earlier) shows through.
-  if (ws.cut > 0) ctx.globalAlpha = 1 - 0.76 * ws.cut;
-
-  if (ws.pillar) {
-    drawPillar(ctx, ws);
-    ctx.globalAlpha = 1;
-    return;
-  }
-
-  // Jittered top corners (N, E, S, W).
+/** Jittered top-slab corners (N, E, S, W), shared by the base fill, the
+ * decoration bake, and the live combined-tint shape. */
+function wallCorners(
+  ws: WallStyle,
+): { nX: number; nY: number; eX: number; eY: number; sX: number; sY: number; wX: number; wY: number } {
+  const { px, py, hgt } = ws;
   const [jN, jE, jS, jW] = ws.jit;
-  const nX = px + jN[0];
-  const nY = py - hgt + jN[1];
-  const eX = px + HW + jE[0];
-  const eY = py + HH - hgt + jE[1];
-  const sX = px + jS[0];
-  const sY = py + TILE_H - hgt + jS[1];
-  const wX = px - HW + jW[0];
-  const wY = py + HH - hgt + jW[1];
+  return {
+    nX: px + jN[0],
+    nY: py - hgt + jN[1],
+    eX: px + HW + jE[0],
+    eY: py + HH - hgt + jE[1],
+    sX: px + jS[0],
+    sY: py + TILE_H - hgt + jS[1],
+    wX: px - HW + jW[0],
+    wY: py + HH - hgt + jW[1],
+  };
+}
 
-  // South-west face.
+/** Flat base fills behind the SW/SE faces — visible at the warped photo
+ * texture's antialiased edges, fully covered everywhere else once it
+ * blits on top. */
+function drawWallFaceBase(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
+  const { px, py, bj, warm } = ws;
+  const { sX, sY, wX, wY, eX, eY } = wallCorners(ws);
   ctx.fillStyle = shade(PALETTE.wallLeft, bj, warm);
   ctx.beginPath();
   ctx.moveTo(px - HW, py + HH);
@@ -597,7 +793,6 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
   ctx.lineTo(wX, wY);
   ctx.closePath();
   ctx.fill();
-  // South-east face.
   ctx.fillStyle = shade(PALETTE.wallRight, bj, warm);
   ctx.beginPath();
   ctx.moveTo(px + HW, py + HH);
@@ -606,14 +801,39 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
   ctx.lineTo(eX, eY);
   ctx.closePath();
   ctx.fill();
+}
 
-  // Photographed masonry for both faces and the top slab, baked once per
-  // tile (see getWallTexCanvas) and blitted as one image — cheap every
-  // frame; only the tint fills below need to re-run as light flickers.
-  if (texturesReady()) {
-    const cached = getWallTexCanvas(ws);
-    ctx.drawImage(cached, px - HW - TEX_PAD, py - hgt - TEX_PAD);
-  }
+/** Adds the SW quad + SE quad + top-slab quad to the current path, without
+ * filling/stroking — used to trace a blitted wall tile's whole silhouette
+ * in one stroke to cover the faint zoom-scaling fringe at its edge. */
+function wallOutlinePath(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
+  const { px, py } = ws;
+  const { nX, nY, eX, eY, sX, sY, wX, wY } = wallCorners(ws);
+  ctx.moveTo(px - HW, py + HH);
+  ctx.lineTo(px, py + TILE_H);
+  ctx.lineTo(sX, sY);
+  ctx.lineTo(wX, wY);
+  ctx.closePath();
+  ctx.moveTo(px + HW, py + HH);
+  ctx.lineTo(px, py + TILE_H);
+  ctx.lineTo(sX, sY);
+  ctx.lineTo(eX, eY);
+  ctx.closePath();
+  ctx.moveTo(nX, nY);
+  ctx.lineTo(eX, eY);
+  ctx.lineTo(sX, sY);
+  ctx.lineTo(wX, wY);
+  ctx.closePath();
+}
+
+// Everything about a wall tile that isn't the photo warp itself: masonry
+// variant, rare accents, stains, top-slab decoration, ruined rubble, frost
+// rime. A pure function of (x, y) plus a brightness/warmth the caller
+// supplies — getWallTexLevels calls this once at bj=1/warm=0 to bake it
+// into the per-tile cache; the (rare, pre-texture-load) live fallback in
+// drawWallBlock calls it directly with the real live brightness.
+function drawWallDecor(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
+  const { px, py, bj, warm, h1, hgt } = ws;
 
   const faces: [number, number, number, number][] = [
     [px - HW, py + HH, px, py + TILE_H], // SW: W corner -> S corner
@@ -782,6 +1002,7 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
 
   // Top slab, jittered — textured (blitted with the faces above) instead
   // of a flat fill, when ready.
+  const { nX, nY, eX, eY, sX, sY, wX, wY } = wallCorners(ws);
   ctx.beginPath();
   ctx.moveTo(nX, nY);
   ctx.lineTo(eX, eY);
@@ -819,15 +1040,6 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
     ctx.lineTo((eX + sX) / 2, (eY + sY) / 2);
     ctx.stroke();
   }
-  // Moon-pale rim on the upper edges — a faint icy edge lingers even where
-  // torch/player light doesn't reach, like distant moonlight through vents.
-  ctx.strokeStyle = `rgba(190,205,222,${0.13 + bj * 0.12})`;
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  ctx.moveTo(wX, wY);
-  ctx.lineTo(nX, nY);
-  ctx.lineTo(eX, eY);
-  ctx.stroke();
 
   if (ws.ruined) {
     // Rubble strewn on the broken top.
@@ -868,16 +1080,65 @@ function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
     }
   }
 
-  if (ws.torch) drawSconce(ctx, ws, hgt);
+}
+
+function drawWallBlock(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
+  const { px, py, hgt } = ws;
+  // Occluding walls turn translucent instead of sinking. The dim explored
+  // cache already blitted beneath keeps them reading as stone, not holes,
+  // while the player (drawn earlier) shows through.
+  const baseAlpha = ws.cut > 0 ? 1 - 0.76 * ws.cut : 1;
+  ctx.globalAlpha = baseAlpha;
+
+  if (ws.pillar) {
+    drawPillar(ctx, ws);
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  if (texturesReady()) {
+    // The whole tile — masonry, accents, top-slab decor, rubble, rime,
+    // sconce glow — is pre-baked into BRIGHTNESS_LEVELS pre-tinted copies
+    // (see getWallTexLevels); live work per frame is a plain drawImage of
+    // whichever one is closest to the current torch/player light, cross-
+    // faded with the next one up via globalAlpha (see brightnessBlend),
+    // instead of redrawing ~15-20 shapes or doing any live compositing.
+    const levels = getWallTexLevels(ws);
+    const bx = Math.round(px - HW - TEX_PAD);
+    const by = Math.round(py - hgt - TEX_PAD);
+    const { lo, hi, frac } = brightnessBlend(ws.bj);
+    ctx.drawImage(levels[lo], bx, by);
+    if (frac > 0.02 && hi !== lo) {
+      ctx.globalAlpha = baseAlpha * frac;
+      ctx.drawImage(levels[hi], bx, by);
+      ctx.globalAlpha = baseAlpha;
+    }
+  } else {
+    // Textures still loading — same procedural look as before, drawn live
+    // since there's nothing to blit yet (this only lasts a moment at
+    // startup, so it isn't worth caching).
+    drawWallFaceBase(ctx, ws);
+    drawWallDecor(ctx, ws);
+  }
+
+  if (ws.torch) {
+    // The glow + bracket are already part of the cached blit above; only
+    // the flickering flame still needs to be live. The fallback branch has
+    // nothing baked yet, so it draws the whole sconce.
+    if (texturesReady()) drawSconceFlame(ctx, ws, hgt);
+    else drawSconce(ctx, ws, hgt);
+  }
   ctx.globalAlpha = 1;
 }
 
-/** A wall-mounted torch: bracket, flame, and warm glow. */
-function drawSconce(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): void {
-  const { px, py, time } = ws;
+/** The torch's bracket + warm glow — fixed position, fixed color stops,
+ * nothing about it changes frame to frame, so it's baked into the wall
+ * tile cache (see getWallTexCanvas) instead of rebuilding the radial
+ * gradient live every frame. */
+function drawSconceBase(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): void {
+  const { px, py } = ws;
   const fx = ws.torch === 'sw' ? px - HW * 0.5 : px + HW * 0.5;
   const fy = py + HH + HH * 0.5 - hgt * 0.45;
-  const flh = time === null ? 1 : 1 + 0.22 * Math.sin(time * 9 + px * 0.7) + 0.12 * Math.sin(time * 23 + py);
 
   const glow = ctx.createRadialGradient(fx, fy - 4, 1, fx, fy - 4, 24);
   glow.addColorStop(0, 'rgba(255,165,60,0.22)');
@@ -891,6 +1152,15 @@ function drawSconce(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): 
   ctx.moveTo(fx, fy + 2);
   ctx.lineTo(fx, fy + 7);
   ctx.stroke();
+}
+
+/** The flame itself — flickers with live time, so it's the one piece of a
+ * sconce still drawn every frame. Cheap: two path fills, no gradient. */
+function drawSconceFlame(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): void {
+  const { px, py, time } = ws;
+  const fx = ws.torch === 'sw' ? px - HW * 0.5 : px + HW * 0.5;
+  const fy = py + HH + HH * 0.5 - hgt * 0.45;
+  const flh = time === null ? 1 : 1 + 0.22 * Math.sin(time * 9 + px * 0.7) + 0.12 * Math.sin(time * 23 + py);
 
   ctx.fillStyle = 'rgba(255,140,45,0.88)';
   ctx.beginPath();
@@ -906,6 +1176,14 @@ function drawSconce(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): 
   ctx.quadraticCurveTo(fx + 0.4, fy - 2 * flh, fx + 1.4, fy + 0.5);
   ctx.closePath();
   ctx.fill();
+}
+
+/** A wall-mounted torch, drawn fully live — used only by the (rare,
+ * transient) pre-texture-load fallback in drawWallBlock, where nothing is
+ * cached yet anyway. */
+function drawSconce(ctx: CanvasRenderingContext2D, ws: WallStyle, hgt: number): void {
+  drawSconceBase(ctx, ws, hgt);
+  drawSconceFlame(ctx, ws, hgt);
 }
 
 function drawPillar(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
@@ -2842,6 +3120,72 @@ function drawEnemy(
   ctx.globalAlpha = 1;
 }
 
+// --- depth-sorted draw pool -------------------------------------------
+// render()'s painter's-algorithm pass (walls + enemies + player, sorted by
+// tile-sum depth) used to allocate a fresh array and ~100-200 fresh arrow
+// closures every frame just to defer drawing until after the sort. This
+// pool is reused across frames — plain tagged slots instead of closures —
+// and only ever grows; drawCount marks how many slots are "live" this
+// frame, so a busier previous frame's leftover slots are simply never
+// reached by the draw loop rather than being reallocated away.
+
+type DrawKind = 0 | 1 | 2; // wall, enemy, player
+
+interface DrawSlot {
+  depth: number;
+  kind: DrawKind;
+  ws: WallStyle | null;
+  e: Enemy | null;
+  fx: number;
+  fy: number;
+  b: number;
+  p: Player | null;
+  pfx: number;
+  pfy: number;
+}
+
+const drawPool: DrawSlot[] = [];
+let drawCount = 0;
+
+function nextDrawSlot(): DrawSlot {
+  if (drawCount === drawPool.length) {
+    drawPool.push({ depth: 0, kind: 0, ws: null, e: null, fx: 0, fy: 0, b: 0, p: null, pfx: 0, pfy: 0 });
+  }
+  return drawPool[drawCount++];
+}
+
+/** Insertion sort over drawPool[0, drawCount) instead of Array#sort. The
+ * list is already close to depth order — walls are pushed in roughly that
+ * order from the tile scan, so only the handful of enemies/player appended
+ * after typically need to move — which is insertion sort's best case, and
+ * it sorts a bounded prefix of a reused array in place without slicing a
+ * fresh one the way Array#sort would require. */
+function sortDrawPool(): void {
+  for (let i = 1; i < drawCount; i++) {
+    const cur = drawPool[i];
+    let j = i - 1;
+    while (j >= 0 && drawPool[j].depth > cur.depth) {
+      drawPool[j + 1] = drawPool[j];
+      j--;
+    }
+    drawPool[j + 1] = cur;
+  }
+}
+
+function drawSlot(ctx: CanvasRenderingContext2D, game: Game, s: DrawSlot): void {
+  switch (s.kind) {
+    case 0:
+      drawWallBlock(ctx, s.ws!);
+      break;
+    case 1:
+      drawEnemy(ctx, s.fx, s.fy, s.e!, s.b, game.time);
+      break;
+    case 2:
+      drawPlayer(ctx, s.pfx, s.pfy, s.p!, game.time);
+      break;
+  }
+}
+
 // --- main render ----------------------------------------------------------
 
 export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt: number): void {
@@ -2870,7 +3214,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
 
   // Cached dim world, then live torchlit region on top.
   ensureStatic(d);
-  ctx.drawImage(staticCanvas!, offX - staticOX, offY - STATIC_OY);
+  ctx.drawImage(staticCanvas!, Math.round(offX - staticOX), Math.round(offY - STATIC_OY));
 
   const pcx = Math.round(game.player.x);
   const pcy = Math.round(game.player.y);
@@ -2949,11 +3293,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
   }
 
   // Torchlit walls and entities, painter-sorted by tile-sum depth.
-  interface Drawable {
-    depth: number;
-    draw: () => void;
-  }
-  const drawables: Drawable[] = [];
+  drawCount = 0;
 
   // The player's screen rect, for the Diablo-style fade on occluding walls.
   const pfx = offX + isoX(game.player.x, game.player.y);
@@ -2985,7 +3325,10 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
         cut = Math.max(0, Math.min(1, (1.3 - t) / 0.55));
       }
       const ws = computeWallStyle(d, x, y, px, py, b, warm, cut, game.time);
-      drawables.push({ depth: x + y, draw: () => drawWallBlock(ctx, ws) });
+      const s = nextDrawSlot();
+      s.kind = 0;
+      s.depth = x + y;
+      s.ws = ws;
     }
   }
 
@@ -2994,16 +3337,27 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
     if (b <= 0.03) continue;
     const fx = offX + isoX(e.x, e.y);
     const fy = offY + isoY(e.x, e.y) + HH;
-    drawables.push({ depth: e.x + e.y, draw: () => drawEnemy(ctx, fx, fy, e, b, game.time) });
+    const s = nextDrawSlot();
+    s.kind = 1;
+    s.depth = e.x + e.y;
+    s.e = e;
+    s.fx = fx;
+    s.fy = fy;
+    s.b = b;
   }
 
   {
     const p = game.player;
-    drawables.push({ depth: p.x + p.y, draw: () => drawPlayer(ctx, pfx, pfy, p, game.time) });
+    const s = nextDrawSlot();
+    s.kind = 2;
+    s.depth = p.x + p.y;
+    s.p = p;
+    s.pfx = pfx;
+    s.pfy = pfy;
   }
 
-  drawables.sort((a, b) => a.depth - b.depth);
-  for (const item of drawables) item.draw();
+  sortDrawPool();
+  for (let i = 0; i < drawCount; i++) drawSlot(ctx, game, drawPool[i]);
 
   // Fireballs in flight.
   for (const pr of game.projectiles) {
