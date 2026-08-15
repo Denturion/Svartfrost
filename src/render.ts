@@ -1388,12 +1388,15 @@ function drawGroundItem(
 ): void {
   ctx.globalAlpha = alpha;
   const pulse = 0.6 + 0.4 * Math.sin(time * 3 + cx * 0.13);
-  const glowColor = loot === 'potion' ? '160,40,45' : '200,215,230';
-  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, 15);
-  glow.addColorStop(0, `rgba(${glowColor},${0.22 * pulse})`);
+  const rc = loot !== 'potion' ? rarityColor(loot) : null;
+  const glowColor = loot === 'potion' ? '160,40,45' : rc ? hexRgbTriple(rc) : '200,215,230';
+  const glowAlpha = rc ? 0.34 : 0.22;
+  const glowR = loot !== 'potion' && loot.rarity === 'legendary' ? 20 : 15;
+  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, glowR);
+  glow.addColorStop(0, `rgba(${glowColor},${glowAlpha * pulse})`);
   glow.addColorStop(1, `rgba(${glowColor},0)`);
   ctx.fillStyle = glow;
-  ctx.fillRect(cx - 16, cy - 16, 32, 32);
+  ctx.fillRect(cx - glowR - 1, cy - glowR - 1, (glowR + 1) * 2, (glowR + 1) * 2);
 
   if (loot === 'potion') {
     ctx.fillStyle = '#5e1218';
@@ -1607,6 +1610,11 @@ function hexTint(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
+function hexRgbTriple(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+}
+
 /** Fills (or strokes, if `stroke`) the current path with a material pattern,
  * then multiply-tints it to match the look the solid-color fallback had. */
 function paintMaterial(
@@ -1728,6 +1736,7 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   ctx.quadraticCurveTo(x - 7.5, y - 23, x - 3.2, y - 24);
   ctx.stroke();
 
+  if (p.armor?.rarity === 'legendary') drawLegendaryAura(ctx, x, y - 14, 16, time + 1);
   drawArmorDecor(ctx, x, y, p.armor?.tier ?? 0);
 
   // Sword arm: a sleeve falling from the shoulder to a pale hand on the
@@ -1743,6 +1752,7 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   ctx.beginPath();
   ctx.arc(armX + 7, y - 9, 1.6, 0, Math.PI * 2);
   ctx.fill();
+  if (p.weapon.rarity === 'legendary') drawLegendaryAura(ctx, armX + 10, y - 18, 14, time);
   drawWeaponIdle(ctx, armX, y, p.weapon.tier);
 
   // Off-hand: a small round shield at the hip, drifting with dirBias the
@@ -1826,7 +1836,8 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
   if (p.lunge > 0.25) {
     const ang = Math.atan2((p.lungeDX + p.lungeDY) * 0.5, p.lungeDX - p.lungeDY);
     const a = Math.PI / 2 - ang;
-    ctx.strokeStyle = `rgba(${SLASH_TINT[p.weapon.tier] ?? '225,230,238'},${p.lunge * 0.9})`;
+    const slashTint = p.weapon.rarity === 'legendary' ? '235,60,50' : SLASH_TINT[p.weapon.tier] ?? '225,230,238';
+    ctx.strokeStyle = `rgba(${slashTint},${p.lunge * 0.9})`;
     ctx.lineWidth = 2.2;
     ctx.beginPath();
     ctx.arc(x, y - 14, 20, a - 0.8, a + 0.8);
@@ -1839,6 +1850,23 @@ function drawPlayer(ctx: CanvasRenderingContext2D, fx: number, fy: number, p: Pl
     ctx.ellipse(x, y - 15, 11, 15, 0, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+/** A pulsing red glow behind an equipped legendary's weapon/armor —
+ * a cheap, generic "this one's special" cue since legendaries otherwise
+ * reuse an existing tier's silhouette rather than getting bespoke art. */
+function drawLegendaryAura(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, time: number): void {
+  const pulse = 0.5 + 0.5 * Math.sin(time * 3);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+  g.addColorStop(0, `rgba(220,40,40,${0.3 + 0.2 * pulse})`);
+  g.addColorStop(1, 'rgba(220,40,40,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
 }
 
 const SLASH_TINT: Record<number, string> = {
@@ -3866,6 +3894,93 @@ function drawTooltipAbove(ctx: CanvasRenderingContext2D, cx: number, bottomY: nu
   });
 }
 
+// Every numeric stat an item can roll, in display order. `pct`/`decimals`
+// drive both the absolute value and the delta shown in the compare box —
+// one format per stat instead of hand-rolling each row twice.
+const STAT_ROWS: { key: keyof Item; label: string; pct?: boolean; decimals?: number }[] = [
+  { key: 'dmgMin', label: 'Min dmg' },
+  { key: 'dmgMax', label: 'Max dmg' },
+  { key: 'armor', label: 'Armor' },
+  { key: 'regen', label: 'HP/s', decimals: 1 },
+  { key: 'manaRegen', label: 'Mana/s', decimals: 1 },
+  { key: 'speed', label: 'Stride', decimals: 1 },
+  { key: 'bleedChance', label: 'Bleed', pct: true },
+  { key: 'slowChance', label: 'Chill', pct: true },
+  { key: 'dmgPct', label: 'Dmg', pct: true },
+  { key: 'atkSpeedPct', label: 'Atk speed', pct: true },
+  { key: 'lifeOnHit', label: 'Life/hit' },
+];
+
+function fmtStat(v: number, row: (typeof STAT_ROWS)[number]): string {
+  if (row.pct) return `${Math.round(v * 100)}%`;
+  if (row.decimals) return v.toFixed(row.decimals);
+  return `${Math.round(v)}`;
+}
+
+/** Hover-compare box: what's equipped in that slot right now, and a
+ * green/red delta per stat versus the item under the cursor — so a pickup
+ * reads as an upgrade or downgrade before you even open its own tooltip.
+ * Draws to the left of the satchel; no-ops (nothing to compare) for tomes,
+ * since two spells aren't a strict better/worse. */
+function drawCompareTooltip(
+  ctx: CanvasRenderingContext2D,
+  rightEdge: number,
+  bottomY: number,
+  hovered: Item,
+  equipped: Item | null,
+  s: number,
+): void {
+  const rows = STAT_ROWS.filter((r) => (hovered[r.key] as number | undefined) || (equipped?.[r.key] as number | undefined));
+  if (rows.length === 0) return;
+  const title = equipped ? equipped.name : '— empty —';
+  const lines = rows.map((row) => {
+    const hv = (hovered[row.key] as number | undefined) ?? 0;
+    const ev = (equipped?.[row.key] as number | undefined) ?? 0;
+    const delta = hv - ev;
+    const deltaText = Math.abs(delta) < 0.0001 ? '—' : `${delta > 0 ? '+' : '−'}${fmtStat(Math.abs(delta), row)}`;
+    return { label: row.label, deltaText, delta };
+  });
+
+  const titleFont = `bold ${13 * s}px ${FONT_GOTHIC}`;
+  const rowFont = `${12 * s}px ${FONT_GOTHIC}`;
+  ctx.font = titleFont;
+  let maxW = ctx.measureText(title).width + 40 * s;
+  ctx.font = rowFont;
+  for (const l of lines) maxW = Math.max(maxW, ctx.measureText(`${l.label}    ${l.deltaText}`).width + 20 * s);
+
+  const lineH = 17 * s;
+  const boxW = Math.min(220 * s, maxW) + 20 * s;
+  const boxH = (lines.length + 1) * lineH + 12 * s;
+  const cx = rightEdge - boxW / 2;
+  const cy = bottomY - boxH / 2 - 8 * s;
+  drawPlate(ctx, cx, cy, boxW, boxH);
+
+  const left = cx - boxW / 2 + 13 * s;
+  const right = cx + boxW / 2 - 13 * s;
+  let ly = cy - boxH / 2 + 16 * s;
+  ctx.textAlign = 'left';
+  ctx.font = `italic ${11 * s}px ${FONT_GOTHIC}`;
+  ctx.fillStyle = 'rgba(220,190,190,0.55)';
+  ctx.fillText('equipped', left, ly);
+  ctx.textAlign = 'right';
+  ctx.font = titleFont;
+  ctx.fillStyle = equipped ? rarityColor(equipped) ?? '#e4e7ec' : 'rgba(180,186,196,0.6)';
+  ctx.fillText(fitText(ctx, title, boxW - 60 * s), right, ly);
+  ctx.textAlign = 'left';
+  ly += lineH;
+
+  ctx.font = rowFont;
+  for (const l of lines) {
+    ctx.fillStyle = 'rgba(205,211,219,0.8)';
+    ctx.fillText(l.label, left, ly);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = l.delta > 0.0001 ? '#5fd66f' : l.delta < -0.0001 ? '#e0554f' : 'rgba(180,186,196,0.7)';
+    ctx.fillText(l.deltaText, right, ly);
+    ctx.textAlign = 'left';
+    ly += lineH;
+  }
+}
+
 /** A pill-shaped key hint, e.g. [Q] Potion — returns its width so callers
  * can lay a row of these out left to right. */
 function drawKeyChip(ctx: CanvasRenderingContext2D, x: number, y: number, key: string, label: string): number {
@@ -4155,8 +4270,9 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
 // Diablo-style rarity coloring: undecorated white/gray for a plain drop,
 // blue for a single-affix magic item, gold for a 2-3 affix rare — so the
 // player can tell a good drop apart from junk without reading the tooltip.
-function rarityColor(loot: { rarity?: 'magic' | 'rare' } | 'potion'): string | null {
+function rarityColor(loot: { rarity?: 'magic' | 'rare' | 'legendary' } | 'potion'): string | null {
   if (loot === 'potion') return null;
+  if (loot.rarity === 'legendary') return '#e0453f';
   if (loot.rarity === 'rare') return '#e0b64a';
   if (loot.rarity === 'magic') return '#6fa8dc';
   return null;
@@ -4283,6 +4399,13 @@ function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): v
       const tipLines = [name, ...(stat ? wrapText(ctx, stat, 190 * s) : [])];
       drawTooltipAbove(ctx, rect.x + rect.w / 2, ry, tipLines);
       ctx.textAlign = 'left';
+
+      const equippedCounterpart =
+        loot.kind === 'weapon' ? p.weapon :
+        loot.kind === 'tome' ? p.spell :
+        loot.kind === 'armor' ? p.armor :
+        loot.kind === 'trinket' ? p.trinket : null;
+      drawCompareTooltip(ctx, rect.x - 10 * s, ry, loot, equippedCounterpart, s);
     }
   }
 }

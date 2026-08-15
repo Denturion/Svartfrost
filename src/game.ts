@@ -373,7 +373,7 @@ export class Game {
       x: gx + (Math.random() - 0.5) * 0.4,
       y: gy + (Math.random() - 0.5) * 0.4,
       loot: item,
-      cd: 1.5,
+      cd: 5,
     });
     sfx.drop();
   }
@@ -725,6 +725,9 @@ export class Game {
           if (p.weapon.bleedChance && Math.random() < p.weapon.bleedChance && target.hp > 0) {
             target.bleedT = 3;
             target.bleedTick = Math.min(target.bleedTick || 0.5, 0.5);
+          }
+          if (p.weapon.slowChance && Math.random() < p.weapon.slowChance && target.hp > 0) {
+            target.slowT = Math.max(target.slowT, 2.5);
           }
         }
       } else if (this.playerRepath <= 0) {
