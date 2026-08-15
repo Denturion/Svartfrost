@@ -77,22 +77,58 @@ const TOMES: Item[] = [
   tome('Tome of the Blood Rite', 6, 'blood'),
 ];
 
-// Hand-authored uniques — fixed name, fixed rolls, no procedural affixes.
-// `tier` here only borrows an existing weapon/armor silhouette for the
-// renderer (see SLASH_TINT / drawWeaponIdle / drawArmorDecor); it doesn't
-// feed the tier-scaling drop tables the way a normal item's tier does.
-function legendary(item: Omit<Item, 'rarity'>): Item {
-  return { ...item, rarity: 'legendary' };
+// Hand-authored uniques — fixed name and base stats, but their affix-like
+// bonus stats (`rollKeys`) roll fresh on every drop instead of sitting at
+// one baked number. `tier` here only borrows an existing weapon/armor
+// silhouette for the renderer (see SLASH_TINT / drawWeaponIdle /
+// drawArmorDecor); it doesn't feed the tier-scaling drop tables the way a
+// normal item's tier does.
+interface LegendaryTemplate {
+  base: Omit<Item, 'rarity'>;
+  rollKeys: (keyof Item)[];
 }
 
-const LEGENDARY_ITEMS: Item[] = [
-  legendary({ ...weapon("Hrímfaxi's Bite", 4, 22, 36), slowChance: 0.55 }),
-  legendary({ ...weapon("The Widow's Kiss", 7, 18, 30), bleedChance: 0.6, lifeOnHit: 3 }),
-  legendary({ ...weapon('Skull-Splitter, Doom of Kings', 6, 28, 44), dmgPct: 0.35 }),
-  legendary({ ...armorItem("Draugr-King's Ribcage", 6, 14), regen: 1.5 }),
-  legendary({ ...armorItem('Cloak of the Hollow Moon', 5, 8), manaRegen: 1.8, speed: 1.2 }),
-  legendary({ ...trinket('Eye of Hollow Yule', 4, {}), armor: 2, regen: 0.8, manaRegen: 0.8, speed: 0.6 }),
+const LEGENDARY_TEMPLATES: LegendaryTemplate[] = [
+  { base: weapon("Hrímfaxi's Bite", 4, 22, 36), rollKeys: ['slowChance'] },
+  { base: weapon("The Widow's Kiss", 7, 18, 30), rollKeys: ['bleedChance', 'lifeOnHit'] },
+  { base: weapon('Skull-Splitter, Doom of Kings', 6, 28, 44), rollKeys: ['dmgPct'] },
+  { base: armorItem("Draugr-King's Ribcage", 6, 14), rollKeys: ['regen'] },
+  { base: armorItem('Cloak of the Hollow Moon', 5, 8), rollKeys: ['manaRegen', 'speed'] },
+  { base: trinket('Eye of Hollow Yule', 4, {}), rollKeys: ['armor', 'regen', 'manaRegen', 'speed'] },
 ];
+
+// Every stat a Legendary can roll picks up exactly where a Rare's own
+// affix range for that same stat tops out, and runs for the same span —
+// a Rare can never roll as high as a Legendary's floor. Mirrors the
+// min/max baked into WEAPON_AFFIXES / ARMOR_AFFIXES above; keep them in
+// sync if those ever change.
+const LEGENDARY_RANGES: Partial<Record<keyof Item, { min: number; max: number; int?: boolean }>> = {
+  dmgPct: { min: 0.3, max: 0.48 }, // rare: 0.12-0.30
+  atkSpeedPct: { min: 0.25, max: 0.4 }, // rare: 0.10-0.25
+  bleedChance: { min: 0.3, max: 0.45 }, // rare: 0.15-0.30
+  slowChance: { min: 0.3, max: 0.45 }, // rare: 0.15-0.30
+  lifeOnHit: { min: 3, max: 5, int: true }, // rare: 1-3
+  armor: { min: 3, max: 5, int: true }, // rare: 1-3
+  regen: { min: 0.8, max: 1.3 }, // rare: 0.3-0.8
+  manaRegen: { min: 0.9, max: 1.5 }, // rare: 0.3-0.9
+  speed: { min: 0.8, max: 1.3 }, // rare: 0.3-0.8
+};
+
+function rollLegendaryStat(key: keyof Item): number {
+  const r = LEGENDARY_RANGES[key];
+  if (!r) return 0;
+  const v = r.min + Math.random() * (r.max - r.min);
+  return r.int ? Math.round(v) : v;
+}
+
+function rollLegendaryItem(): Item {
+  const t = pick(LEGENDARY_TEMPLATES);
+  const item = { ...t.base, rarity: 'legendary' as const };
+  for (const key of t.rollKeys) {
+    (item[key] as number) = rollLegendaryStat(key);
+  }
+  return item;
+}
 
 function poolOf(kind: Item['kind']): Item[] {
   return kind === 'weapon' ? WEAPONS : kind === 'armor' ? ARMORS : kind === 'tome' ? TOMES : TRINKETS;
@@ -195,7 +231,7 @@ const LEGENDARY_CHANCE = 0.015;
 function maybeLegendary(depth: number, boosted: boolean): Item | null {
   if (!boosted || depth < 10) return null;
   if (Math.random() >= LEGENDARY_CHANCE) return null;
-  return { ...pick(LEGENDARY_ITEMS) };
+  return rollLegendaryItem();
 }
 
 export type Loot = Item | 'potion';
