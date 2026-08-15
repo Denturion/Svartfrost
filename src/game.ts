@@ -1002,6 +1002,7 @@ export class Game {
       }
       this.gainXp(e.xpValue);
       sfx.enemyDie();
+      if (e.kind === 'boss') sfx.bossDie();
       if (e.rare) this.banner = { text: e.name, sub: 'a rare foe falls', t: 2.4 };
     }
   }
