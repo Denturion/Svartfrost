@@ -3829,6 +3829,24 @@ function drawPlate(ctx: CanvasRenderingContext2D, cx: number, cy: number, w: num
   ctx.stroke();
 }
 
+/** Same steel-plate fill as drawPlate, but square-cornered — tooltip text
+ * is laid out assuming a rectangle, and drawPlate's fully rounded (r=h/2)
+ * ends eat into that corner space enough to clip the text. */
+function drawTooltipBox(ctx: CanvasRenderingContext2D, cx: number, cy: number, w: number, h: number): void {
+  ctx.beginPath();
+  ctx.rect(cx - w / 2, cy - h / 2, w, h);
+  const steel = getUiSteelPattern(ctx);
+  if (steel) {
+    paintMaterial(ctx, steel, 'rgba(8,8,10,0.8)', false);
+  } else {
+    ctx.fillStyle = 'rgba(8,7,9,0.82)';
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(150,156,166,0.4)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+}
+
 /** High-contrast text: a dark offset pass under the pale fill, so it reads
  * over any background instead of blending into it. */
 function fillTextPop(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, fill = '#f2f3f6'): void {
@@ -3885,7 +3903,7 @@ function drawTooltipAbove(ctx: CanvasRenderingContext2D, cx: number, bottomY: nu
   const boxW = maxW + 26;
   const boxH = lines.length * lineH + 12;
   const cy = bottomY - boxH / 2 - 8;
-  drawPlate(ctx, cx, cy, boxW, boxH);
+  drawTooltipBox(ctx, cx, cy, boxW, boxH);
   const top = cy - boxH / 2 + 16;
   lines.forEach((l, i) => {
     ctx.font = i === 0 ? `bold 13px ${FONT_GOTHIC}` : `12px ${FONT_GOTHIC}`;
@@ -3953,7 +3971,7 @@ function drawCompareTooltip(
   const boxH = (lines.length + 1) * lineH + 12 * s;
   const cx = rightEdge - boxW / 2;
   const cy = bottomY - boxH / 2 - 8 * s;
-  drawPlate(ctx, cx, cy, boxW, boxH);
+  drawTooltipBox(ctx, cx, cy, boxW, boxH);
 
   const left = cx - boxW / 2 + 13 * s;
   const right = cx + boxW / 2 - 13 * s;
