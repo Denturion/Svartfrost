@@ -2,9 +2,12 @@
 
 A Diablo 1-inspired action RPG with a black metal theme. TypeScript, Vite,
 and raw Canvas 2D — no game engine. Geometry, animation, and lighting are
-all procedural; a small set of AI-generated stone/ice/leather/skin photos
-(`public/textures/`) are affine-warped onto that geometry and downsampled
-for a chunky 90s look, rather than being painted on as flat sprites.
+all procedural for the dungeon and every enemy. A small set of
+AI-generated stone/ice/leather/skin photos (`public/textures/`) are
+affine-warped onto the dungeon geometry and downsampled for a chunky 90s
+look, rather than being painted on as flat sprites. The player character
+is the one exception: it's a layered sprite (`public/isometric_hero/`) —
+see "Entities" under Rendering & performance below.
 
 **Play it:** [https://svartfrost.vercel.app/]
 
@@ -26,17 +29,30 @@ for a chunky 90s look, rather than being painted on as flat sprites.
   plus depth-gated "rare" unique variants with stat boosts and a spikier,
   tinted silhouette
 - Bosses cast a periodic hostile hazard pool and enter an enraged,
-  faster/harder-hitting phase below 30% hp
-- Itemization: weapon and armor drops can roll magic (1 affix) or rare
-  (2-3 affixes) — bonus damage, attack speed, life on hit, bleed chance,
-  armor, regen, mana regen, or stride — color-coded blue/gold in the
-  satchel, with a hover tooltip for the full stat line
-- Loot: weapons, armor, trinkets, and spell tomes across tiers
+  faster/harder-hitting phase below 30% hp; a pitch-shifting tremolo riff
+  plays for the whole fight and cuts to a scream on death
+- Itemization: weapon, armor, and trinket drops can roll magic (1 affix)
+  or rare (2-3 affixes) — bonus damage, attack speed, life on hit, bleed
+  chance, armor, regen, mana regen, stride, or (trinkets only) spell
+  damage/cooldown — color-coded blue/gold in the satchel, with a hover
+  tooltip showing a +/- stat comparison against whatever's equipped.
+  Past floor 10, gray (unenchanted) drops stop appearing entirely.
+  Bosses and rare mobs can also drop **Legendary** items past floor 10 —
+  rare, hand-crafted uniques (red name, fixed identity, rolled bonus
+  stats starting above what Rare can reach for that same stat)
+- Loot: weapons, armor, and trinkets across tiers, plus spell tomes —
+  picking one up teaches that spell permanently for the run instead of
+  sitting in the satchel as gear, so duplicates never pile up
 - Six spells: Frost Nova, Fire Nova, Fireball, Lightning, Plague Bloom
-  (lingering poison hazard), and Blood Rite (life-drain burst + bleed)
+  (lingering poison hazard), and Blood Rite (life-drain burst + bleed).
+  Right-click (or long-press, touch) the mana orb to pick which spell
+  you've learned is active
 - A boss every fifth depth, named for the black metal pantheon, each with
   a distinct look
-- Procedural WebAudio soundtrack that shifts mood every five depths
+- Procedural WebAudio soundtrack that shifts mood every five depths, with
+  rare, distant ambient melodies drifting in at low volume
+- Wall and floor surface variety — carved rune/pentagram sigils, water
+  stains, dried blood, dirt — baked once per tile, so it's free at runtime
 - Save/continue with checkpoints at each depth, plus lifetime records
 
 ## Rendering & performance
@@ -94,7 +110,23 @@ optimization work rather than re-discovering it every time. References:
   pushed in roughly that order from the tile scan — which is insertion
   sort's best case, and it avoids slicing a fresh array the way
   `Array#sort` on a sub-range would require).
-- **Entities (player/enemies/bosses):** still no sprites — every body is a
+- **Entities — player:** a layered sprite (`sprites.ts`) — separate armor,
+  weapon, and head spritesheets from `public/isometric_hero/` composited
+  per frame, 128x128px cells, 32 animation columns x 8 screen-space
+  direction rows. Facing comes from the movement vector (or, idle, the
+  last attack's aim); the animation frame is picked from `Math.floor(game.time
+  * fps) % segmentLength` — elapsed time, never a per-render counter, so
+  playback speed can't drift with frame rate. Torch/player light is
+  applied as a direct per-pixel RGB multiply via `getImageData`/
+  `putImageData` rather than a canvas composite-mode blend — the
+  multiply-then-`destination-in`-mask trick tiles use (see below) left a
+  faint ghost of the sprite's own silhouette bleeding into its transparent
+  margin here, and per-pixel math can't bleed by construction. Falls back
+  to the original procedural vector `drawPlayer()` until the sheets finish
+  loading. Confirmed cost-neutral via an A/B test (same page, same
+  session, code toggled and reloaded): no measurable FPS difference
+  on or off.
+- **Entities — enemies/bosses:** still no sprites — every body is a
   hand-drawn vector silhouette (`beginPath` + `lineTo`/`quadraticCurveTo`
   chains) rebuilt from scratch every frame for every visible entity, with
   cloth/skin/steel rendered as a repeating `CanvasPattern` from a photo
@@ -102,7 +134,10 @@ optimization work rather than re-discovering it every time. References:
   entirely on touch devices (`isTouchDevice`) as a mobile perf mitigation
   landed earlier. **Not yet optimized** — tile rendering was the dominant
   cost (hundreds of tiles vs. a handful of entities on screen at once), so
-  this was left as documented future work rather than tackled now.
+  this was left as documented future work rather than tackled now. The
+  `isometric_hero` pack is a single humanoid hero — nothing in it fits a
+  draugr/wretch/boss silhouette, so sprite-vs-vector is currently decided
+  per entity *kind*, and every kind but the player still resolves to vector.
 - **Gradients:** the torch sconce's glow is now baked (see above). The
   remaining `createRadialGradient` call sites (ground-item glow, hazard
   wash, eye glow, projectile glow, player cloak shading) are still built
@@ -134,7 +169,8 @@ npm run build  # type-check + production build to dist/
 | Input | Action |
 | --- | --- |
 | Left click / hold | Move (attack when on an enemy) |
-| Right click / F | Cast the equipped spell |
+| Right click / F | Cast the active spell |
+| Right click the mana orb (long-press, touch) | Pick which learned spell is active |
 | Q or 1 | Drink a potion |
 | I | Open the satchel |
 | WASD / arrows | Step |
@@ -144,20 +180,20 @@ npm run build  # type-check + production build to dist/
 ## Roadmap
 
 Mobile touch controls, a production-build performance pass, the draugr's
-material texture, and a first round of "more content" (new enemy kinds,
-boss mechanics, and item affixes) are all done. What's left:
+material texture, a first round of "more content" (new enemy kinds, boss
+mechanics, and item affixes), hand-crafted Legendary uniques, gray-item
+gating past floor 10, the learn-a-spell-once rework, and a first pass at
+sprite-rendering the player are all done. What's left:
 
 1. **Key rebinding.** There's a volume slider on the pause screen now, but
    controls are still hardcoded — let players remap before this goes in
    front of more people.
-2. **Deeper itemization, round two.** The affix system covers weapon and
-   armor drops; a second accessory slot or a small set of hand-crafted
-   uniques (fixed name + fixed affixes, Diablo 1 style) would give
-   end-game loot more to chase beyond bigger numbers.
-3. **A stretch enemy or two.** The proposed telegraphed "brute" landed as
-   the Barrow Brute; a slower, more dangerous heavy (multiple telegraphed
-   attacks, or a shielded variant that punishes careless ranged spam)
-   is the natural next step if the roster needs more variety.
-
-
-Then some more stuff.
+2. **Sprite art for enemies.** Only the player uses the layered sprite
+   pack today (see Rendering & performance); every enemy kind, including
+   the Barrow Brute already in the game, is still the hand-drawn vector
+   look. Closing that gap needs sprite sheets that fit each kind.
+3. **A stretch enemy or two.** The Barrow Brute (telegraphed slam,
+   already in the game) covered the first heavy-hitter idea; a slower,
+   more dangerous heavy (multiple telegraphed attacks, or a shielded
+   variant that punishes careless ranged spam) is the natural next step
+   if the roster needs more variety.
