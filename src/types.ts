@@ -1,4 +1,5 @@
 import type { Item, Loot } from './items';
+import type { SpellId } from './spells';
 
 export interface Point {
   x: number;
@@ -57,7 +58,8 @@ export interface Player extends Entity {
   weapon: Item;
   armor: Item | null;
   trinket: Item | null;
-  spell: Item; // equipped tome, always present
+  knownSpells: SpellId[]; // learned by picking up a tome; resets each run
+  activeSpell: SpellId; // which known spell casts — chosen from the HUD dropdown
 }
 
 export interface DamageNumber {

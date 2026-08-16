@@ -17,6 +17,8 @@ export interface Item {
   dmgPct?: number; // weapon affix: bonus % damage
   atkSpeedPct?: number; // weapon affix: bonus % attack speed
   lifeOnHit?: number; // weapon affix: flat hp healed per successful hit
+  spellDmgPct?: number; // trinket affix: bonus % damage on cast spells
+  spellCdPct?: number; // trinket affix: % reduction to spell cooldown
   // Set only when an affix roll hits — undefined items are the plain base
   // drop. Drives both the name decoration and the satchel's color coding.
   rarity?: 'magic' | 'rare' | 'legendary';
@@ -94,7 +96,10 @@ const LEGENDARY_TEMPLATES: LegendaryTemplate[] = [
   { base: weapon('Skull-Splitter, Doom of Kings', 6, 28, 44), rollKeys: ['dmgPct'] },
   { base: armorItem("Draugr-King's Ribcage", 6, 14), rollKeys: ['regen'] },
   { base: armorItem('Cloak of the Hollow Moon', 5, 8), rollKeys: ['manaRegen', 'speed'] },
-  { base: trinket('Eye of Hollow Yule', 4, {}), rollKeys: ['armor', 'regen', 'manaRegen', 'speed'] },
+  {
+    base: trinket('Eye of Hollow Yule', 4, {}),
+    rollKeys: ['armor', 'regen', 'manaRegen', 'speed', 'spellDmgPct', 'spellCdPct'],
+  },
 ];
 
 // Every stat a Legendary can roll picks up exactly where a Rare's own
@@ -112,6 +117,8 @@ const LEGENDARY_RANGES: Partial<Record<keyof Item, { min: number; max: number; i
   regen: { min: 0.8, max: 1.3 }, // rare: 0.3-0.8
   manaRegen: { min: 0.9, max: 1.5 }, // rare: 0.3-0.9
   speed: { min: 0.8, max: 1.3 }, // rare: 0.3-0.8
+  spellDmgPct: { min: 0.35, max: 0.55 }, // rare: 0.15-0.35
+  spellCdPct: { min: 0.25, max: 0.38 }, // rare: 0.12-0.25
 };
 
 function rollLegendaryStat(key: keyof Item): number {
@@ -136,10 +143,6 @@ function poolOf(kind: Item['kind']): Item[] {
 
 export function startingWeapon(): Item {
   return { ...WEAPONS[0] };
-}
-
-export function startingTome(): Item {
-  return { ...TOMES[0] };
 }
 
 function clampTier(t: number, kind: Item['kind']): number {
@@ -183,6 +186,16 @@ const ARMOR_AFFIXES: Affix[] = [
   { apply: (i) => { i.speed += 0.3 + Math.random() * 0.5; }, tags: ['of the Crow', 'of Swiftness'] },
 ];
 
+// Trinkets get everything armor can roll (they already carry the same
+// stat surface) plus two spellcasting-only affixes — since spells stopped
+// being physical gear (see maybeEnchant below), trinkets are now the only
+// place a build can lean into spell damage/cooldown.
+const TRINKET_AFFIXES: Affix[] = [
+  ...ARMOR_AFFIXES,
+  { apply: (i) => { i.spellDmgPct = (i.spellDmgPct ?? 0) + 0.15 + Math.random() * 0.2; }, tags: ['of the Magus', 'of Power'] },
+  { apply: (i) => { i.spellCdPct = Math.min(0.5, (i.spellCdPct ?? 0) + 0.12 + Math.random() * 0.13); }, tags: ['of Alacrity', 'of the Adept'] },
+];
+
 const RARE_PREFIXES = ['Runed', 'Bloodforged', 'Grim', 'Cursed', 'Baleful', 'Wraithbound'];
 
 function pick<T>(arr: T[]): T {
@@ -198,14 +211,18 @@ function pickN<T>(arr: T[], n: number): T[] {
   return picked;
 }
 
-// Rolls a chance for a weapon/armor drop to come out magic (1 affix) or
-// rare (2-3 affixes) on top of its base tier stats — Diablo 1-style loot
-// variance instead of every tier-N item being identical. `boosted` widens
-// the odds for boss/rare-mob drops. `forceEnchant` (past floor 10) turns
-// what would've been a plain gray drop into a magic one instead of
-// discarding the rarity roll entirely — gray items stop existing outright.
+// Rolls a chance for a drop to come out magic (1 affix) or rare (2-3
+// affixes) on top of its base tier stats — Diablo 1-style loot variance
+// instead of every tier-N item being identical. `boosted` widens the odds
+// for boss/rare-mob drops. `forceEnchant` (past floor 10) turns what
+// would've been a plain gray drop into a magic one instead of discarding
+// the rarity roll entirely — gray items stop existing outright. Called on
+// every equippable kind (weapon/armor/trinket) so the floor-10 ban covers
+// all of them. Tomes never come through here — picking one up teaches the
+// spell and consumes it outright, so there's no gear/rarity concept left
+// to apply (see game.ts's pickup loop and rollDrops below).
 function maybeEnchant(item: Item, boosted: boolean, forceEnchant: boolean): Item {
-  const pool = item.kind === 'weapon' ? WEAPON_AFFIXES : ARMOR_AFFIXES;
+  const pool = item.kind === 'weapon' ? WEAPON_AFFIXES : item.kind === 'trinket' ? TRINKET_AFFIXES : ARMOR_AFFIXES;
   const roll = Math.random();
   const rareChance = boosted ? 0.22 : 0.08;
   const magicChance = boosted ? 0.5 : 0.28;
@@ -247,14 +264,14 @@ export function rollDrops(depth: number, boss: boolean): Loot[] {
       const kind = Math.random() < 0.5 ? 'weapon' : 'armor';
       drops.push(maybeEnchant(itemOfTier(kind, clampTier(Math.ceil(depth / 2) + 1, kind)), true, pastGrayFloor));
     }
-    if (Math.random() < 0.4) drops.push(itemOfTier('trinket', rollTier(depth, 'trinket')));
+    if (Math.random() < 0.4) drops.push(maybeEnchant(itemOfTier('trinket', rollTier(depth, 'trinket')), true, pastGrayFloor));
     return drops;
   }
   const r = Math.random();
   if (r < 0.2) return ['potion'];
   if (r < 0.27) return [maybeEnchant(itemOfTier('weapon', rollTier(depth, 'weapon')), false, pastGrayFloor)];
   if (r < 0.34) return [maybeEnchant(itemOfTier('armor', rollTier(depth, 'armor')), false, pastGrayFloor)];
-  if (r < 0.385) return [itemOfTier('trinket', rollTier(depth, 'trinket'))];
+  if (r < 0.385) return [maybeEnchant(itemOfTier('trinket', rollTier(depth, 'trinket')), false, pastGrayFloor)];
   if (r < 0.425) return [itemOfTier('tome', rollTier(depth, 'tome'))];
   return [];
 }
@@ -274,6 +291,8 @@ export function itemStatLine(i: Item): string {
   if (i.dmgPct) parts.push(`+${Math.round(i.dmgPct * 100)}% damage`);
   if (i.atkSpeedPct) parts.push(`+${Math.round(i.atkSpeedPct * 100)}% atk speed`);
   if (i.lifeOnHit) parts.push(`+${i.lifeOnHit} life/hit`);
+  if (i.spellDmgPct) parts.push(`+${Math.round(i.spellDmgPct * 100)}% spell damage`);
+  if (i.spellCdPct) parts.push(`-${Math.round(i.spellCdPct * 100)}% spell cooldown`);
   return parts.join(', ');
 }
 

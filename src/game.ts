@@ -10,7 +10,7 @@ import type { Records, RunSave } from './save';
 import { sfx, setMusicDepth } from './sound';
 import { SPELLS } from './spells';
 import type { SpellId } from './spells';
-import { hudLayout, invMetrics, invPanelRect, titleMenu } from './ui';
+import { hudLayout, invMetrics, invPanelRect, spellMenuLayout, titleMenu } from './ui';
 import { isTouchDevice } from './device';
 import type {
   Corpse,
@@ -86,6 +86,9 @@ export class Game {
   // Touch has no right-click to cast with, so tapping the mana orb "arms"
   // the spell — the next tap on the field casts there instead of moving.
   spellArmed = false;
+  // Right-click (or long-press, touch) the mana orb to pick which known
+  // spell is active, instead of casting — see uiRightClick()/uiClick().
+  spellMenuOpen = false;
   showFps = false;
   hurtFlash = 0;
   banner = { text: '', sub: '', t: 0 };
@@ -178,7 +181,8 @@ export class Game {
         weapon: p.weapon,
         armor: p.armor,
         trinket: p.trinket,
-        spell: p.spell,
+        knownSpells: p.knownSpells,
+        activeSpell: p.activeSpell,
         inventory: p.inventory,
       },
     };
@@ -280,6 +284,16 @@ export class Game {
 
   /** Returns true if the click/tap landed on UI and should not reach the world. */
   uiClick(mx: number, my: number, viewW: number, viewH: number): boolean {
+    if (this.spellMenuOpen) {
+      const m = spellMenuLayout(viewW, viewH, this.player.knownSpells.length);
+      if (mx >= m.x && mx <= m.x + m.w && my >= m.y && my <= m.y + m.h) {
+        const row = Math.floor((my - m.y - m.pad) / m.rowH);
+        if (row >= 0 && row < this.player.knownSpells.length) this.selectSpell(this.player.knownSpells[row]);
+        return true;
+      }
+      this.spellMenuOpen = false;
+      return true;
+    }
     if (this.invOpen) {
       const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
       if (mx >= rect.x && mx <= rect.x + rect.w && my >= rect.y && my <= rect.y + rect.h) {
@@ -318,8 +332,17 @@ export class Game {
     return false;
   }
 
-  /** Right-clicks on the satchel drop the row's item; returns true if consumed. */
+  /** Right-clicks on the satchel drop the row's item; a right-click on the
+   * mana orb opens the known-spell picker instead of casting. Returns true
+   * if consumed. */
   uiRightClick(mx: number, my: number, viewW: number, viewH: number): boolean {
+    if (this.screen === 'playing' && !this.invOpen) {
+      const layout = hudLayout(viewW, viewH);
+      if (Math.hypot(mx - layout.manaCx, my - layout.orbY) < layout.bezelR) {
+        this.spellMenuOpen = !this.spellMenuOpen;
+        return true;
+      }
+    }
     if (!this.invOpen) return false;
     const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
     if (mx < rect.x || mx > rect.x + rect.w || my < rect.y || my > rect.y + rect.h) return false;
@@ -327,6 +350,15 @@ export class Game {
     const row = Math.floor((my - rect.y - m.headerH) / m.rowH);
     if (row >= 0 && row < this.player.inventory.length) this.dropFromInventory(row);
     return true;
+  }
+
+  toggleSpellMenu(): void {
+    this.spellMenuOpen = !this.spellMenuOpen;
+  }
+
+  selectSpell(id: SpellId): void {
+    if (this.player.knownSpells.includes(id)) this.player.activeSpell = id;
+    this.spellMenuOpen = false;
   }
 
   equipFromInventory(index: number): void {
@@ -337,8 +369,12 @@ export class Game {
       p.inventory[index] = p.weapon;
       p.weapon = item;
     } else if (item.kind === 'tome') {
-      p.inventory[index] = p.spell;
-      p.spell = item;
+      // Tomes never land in inventory anymore (picking one up teaches the
+      // spell and consumes it) — this only fires for a stale item from a
+      // save made before that change. Discard it rather than misfile it
+      // into the armor/trinket branch below.
+      p.inventory.splice(index, 1);
+      return;
     } else {
       const prev = item.kind === 'armor' ? p.armor : p.trinket;
       if (prev) p.inventory[index] = prev;
@@ -473,10 +509,13 @@ export class Game {
   castSpell(tileX: number, tileY: number): void {
     if (this.screen !== 'playing') return;
     const p = this.player;
-    const id: SpellId = p.spell.spell ?? 'frostnova';
+    const id: SpellId = p.activeSpell;
     if (this.novaCd > 0 || p.mana < SPELLS[id].cost) return;
     p.mana -= SPELLS[id].cost;
-    this.novaCd = 0.6;
+    // Magic/rare trinkets can roll spellDmgPct/spellCdPct (see items.ts) —
+    // tomes stopped being gear, so trinkets are now the only spell-power lever.
+    const spellDmgMul = 1 + (p.trinket?.spellDmgPct ?? 0);
+    this.novaCd = 0.6 * (1 - (p.trinket?.spellCdPct ?? 0));
     p.castT = 1;
 
     // Aim direction for targeted spells.
@@ -500,7 +539,7 @@ export class Game {
         for (const e of [...this.enemies]) {
           if (Math.hypot(e.x - p.x, e.y - p.y) <= NOVA_RADIUS) {
             e.slowT = 3;
-            this.damageEnemy(e, 6 + ((Math.random() * 7) | 0) + p.level, '#9fc4d8', true);
+            this.damageEnemy(e, Math.round((6 + ((Math.random() * 7) | 0) + p.level) * spellDmgMul), '#9fc4d8', true);
           }
         }
         break;
@@ -509,7 +548,7 @@ export class Game {
         sfx.firenova();
         for (const e of [...this.enemies]) {
           if (Math.hypot(e.x - p.x, e.y - p.y) <= NOVA_RADIUS) {
-            this.damageEnemy(e, 11 + ((Math.random() * 9) | 0) + p.level, '#e8a25a', true);
+            this.damageEnemy(e, Math.round((11 + ((Math.random() * 9) | 0) + p.level) * spellDmgMul), '#e8a25a', true);
           }
         }
         break;
@@ -532,7 +571,7 @@ export class Game {
         sfx.lightning();
         for (const e of [...this.enemies]) {
           if (segmentDist(p.x, p.y, ex, ey, e.x, e.y) <= 0.8) {
-            this.damageEnemy(e, 9 + ((Math.random() * 8) | 0) + p.level, '#e8e6ff', true);
+            this.damageEnemy(e, Math.round((9 + ((Math.random() * 8) | 0) + p.level) * spellDmgMul), '#e8e6ff', true);
           }
         }
         break;
@@ -567,7 +606,7 @@ export class Game {
         this.effects.push({ kind: 'drain', x: p.x, y: p.y, x2: target?.x ?? ex, y2: target?.y ?? ey, r: 0, t: 0 });
         sfx.bloodrite();
         if (target) {
-          const dmg = 10 + ((Math.random() * 8) | 0) + p.level;
+          const dmg = Math.round((10 + ((Math.random() * 8) | 0) + p.level) * spellDmgMul);
           this.damageEnemy(target, dmg, '#e8555f', true);
           const heal = Math.round(dmg * 0.45);
           p.hp = Math.min(p.maxHp, p.hp + heal);
@@ -761,6 +800,20 @@ export class Game {
         if (p.potions >= BELT_SIZE) return true;
         p.potions++;
         this.dmgNums.push({ x: p.x, y: p.y, value: 'potion', t: 1, color: '#7a9c7a' });
+      } else if (g.loot.kind === 'tome') {
+        // A tome teaches its spell permanently (for this run) and is
+        // consumed outright — it never occupies an inventory slot, so
+        // there's no such thing as picking up 10 duplicate Frost Novas.
+        const id = g.loot.spell ?? 'frostnova';
+        const alreadyKnown = p.knownSpells.includes(id);
+        if (!alreadyKnown) p.knownSpells.push(id);
+        this.dmgNums.push({
+          x: p.x,
+          y: p.y,
+          value: alreadyKnown ? 'already known' : `learned ${SPELLS[id].name}`,
+          t: 1,
+          color: '#9fc4d8',
+        });
       } else {
         p.inventory.push(g.loot);
         this.dmgNums.push({ x: p.x, y: p.y, value: g.loot.name, t: 1, color: '#d8dce2' });

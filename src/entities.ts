@@ -1,4 +1,4 @@
-import { startingTome, startingWeapon } from './items';
+import { startingWeapon } from './items';
 import type { Enemy, EnemyKind, Player } from './types';
 
 export function createPlayer(x: number, y: number): Player {
@@ -30,7 +30,8 @@ export function createPlayer(x: number, y: number): Player {
     weapon: startingWeapon(),
     armor: null,
     trinket: null,
-    spell: startingTome(),
+    knownSpells: ['frostnova'],
+    activeSpell: 'frostnova',
   };
   recalcStats(p);
   return p;

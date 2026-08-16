@@ -1,4 +1,5 @@
 import type { Item } from './items';
+import type { SpellId } from './spells';
 
 export interface SavedPlayer {
   level: number;
@@ -11,7 +12,8 @@ export interface SavedPlayer {
   weapon: Item;
   armor: Item | null;
   trinket: Item | null;
-  spell: Item;
+  knownSpells: SpellId[];
+  activeSpell: SpellId;
   inventory: Item[];
 }
 

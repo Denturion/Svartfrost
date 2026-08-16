@@ -496,8 +496,14 @@ export const sfx = {
   },
   stairs: () => thud(45, 1.0, 0.4),
   nova: () => {
-    noiseBurst(0.35, 2200, 0.12, 'highpass');
-    sweep(1400, 180, 0.45, 0.1);
+    // A pure sine sweep with no low end read as a toy "boop" — this keeps
+    // the icy crack up top but gives it a body: a sawtooth sweep for real
+    // harmonic weight, a second one an octave down for thickness, and a
+    // sub thud (missing entirely before) for the actual blast impact.
+    noiseBurst(0.3, 2600, 0.1, 'highpass');
+    sweep(1100, 140, 0.5, 0.16, 'sawtooth');
+    sweep(550, 90, 0.55, 0.1, 'triangle');
+    thud(85, 0.5, 0.22);
   },
   firenova: () => {
     noiseBurst(0.4, 500, 0.22, 'lowpass');
@@ -541,6 +547,11 @@ export const sfx = {
     scream();
   },
   playerDie: () => {
+    // Dying to a boss otherwise leaves its music running forever: the
+    // setMusicDepth() safety net only stops it on an actual mood-bucket
+    // change, and restarting from death always re-enters depth 1, which
+    // is the same mood bucket as any death within depths 1-5.
+    stopBossMusic();
     noiseBurst(0.6, 200, 0.25);
     thud(50, 1.6, 0.4);
   },
