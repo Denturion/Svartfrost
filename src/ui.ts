@@ -20,6 +20,7 @@ export interface HudLayout {
   killBadge: { x: number; y: number };
   satchelBtn: { x: number; y: number; r: number };
   pauseBtn: { x: number; y: number; r: number };
+  spellBtn: { x: number; y: number; w: number; h: number };
 }
 
 export function hudLayout(viewW: number, viewH: number): HudLayout {
@@ -30,6 +31,9 @@ export function hudLayout(viewW: number, viewH: number): HudLayout {
   const manaCx = viewW - healthCx;
   const orbY = viewH - bezelR - 22 * scale;
   const btnR = 24 * scale;
+  const spellY = orbY - bezelR - 15 * scale; // matches the name label's baseline in render.ts
+  const spellBtnW = 128 * scale;
+  const spellBtnH = 26 * scale;
   return {
     scale,
     orbR,
@@ -43,6 +47,9 @@ export function hudLayout(viewW: number, viewH: number): HudLayout {
     // (top-right) — the one corner nothing else already claims.
     satchelBtn: { x: btnR + 16 * scale, y: btnR + 16 * scale, r: btnR },
     pauseBtn: { x: btnR + 16 * scale, y: btnR * 3 + 30 * scale, r: btnR },
+    // The active-spell name, sitting above the mana orb, doubles as a
+    // button — click it to open the known-spell picker (see spellMenuLayout).
+    spellBtn: { x: manaCx - spellBtnW / 2, y: spellY - spellBtnH * 0.7, w: spellBtnW, h: spellBtnH },
   };
 }
 

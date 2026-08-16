@@ -34,7 +34,7 @@ import { getVolume } from './sound';
 import { SPELLS } from './spells';
 import { xpNext } from './entities';
 import type { Enemy, Player } from './types';
-import { drawPlayerSprite, playerSpritesReady } from './sprites';
+import { drawEnemySprite, drawPlayerSprite, enemySpritesReady, playerSpritesReady } from './sprites';
 
 const HW = TILE_W / 2;
 const HH = TILE_H / 2;
@@ -3205,7 +3205,8 @@ function drawSlot(ctx: CanvasRenderingContext2D, game: Game, s: DrawSlot): void 
       drawWallBlock(ctx, s.ws!);
       break;
     case 1:
-      drawEnemy(ctx, s.fx, s.fy, s.e!, s.b, game.time);
+      if (enemySpritesReady(s.e!)) drawEnemySprite(ctx, s.fx, s.fy, s.e!, game.time, s.b, s.warm);
+      else drawEnemy(ctx, s.fx, s.fy, s.e!, s.b, game.time);
       break;
     case 2:
       if (playerSpritesReady(s.p!)) drawPlayerSprite(ctx, s.pfx, s.pfy, s.p!, game.time, s.b, s.warm);
@@ -3372,6 +3373,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
     s.fx = fx;
     s.fy = fy;
     s.b = b;
+    s.warm = outWarm;
   }
 
   {
@@ -4130,20 +4132,29 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
     ctx.stroke();
   }
 
-  // Active spell above the mana orb — hover (or tap the orb) to see its cost.
-  ctx.textAlign = 'center';
-  ctx.font = `bold ${17 * s}px ${FONT_GOTHIC}`;
+  // Active spell above the mana orb — also a button: click/tap it to open
+  // the known-spell picker (layout.spellBtn, handled in game.ts's uiClick).
   const spell = SPELLS[p.activeSpell];
   const spellY = orbY - bezelR - 15 * s;
+  const sb = layout.spellBtn;
+  const spellBtnHovered =
+    view.mouseX >= sb.x && view.mouseX <= sb.x + sb.w && view.mouseY >= sb.y && view.mouseY <= sb.y + sb.h;
+  drawPlate(ctx, manaCx, sb.y + sb.h / 2, sb.w, sb.h);
+  if (spellBtnHovered) {
+    ctx.strokeStyle = 'rgba(159,213,235,0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${17 * s}px ${FONT_GOTHIC}`;
   fillTextPop(ctx, spell.name, manaCx, spellY);
-  if (!game.spellMenuOpen && Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
-    const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click a target';
-    const switchHow = isTouchDevice ? 'hold the orb' : 'right-click the orb';
-    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [
-      spell.name,
-      `${spell.cost} mana · ${how} to cast`,
-      `${switchHow} to switch spell`,
-    ]);
+  if (!game.spellMenuOpen) {
+    if (spellBtnHovered) {
+      drawTooltipAbove(ctx, manaCx, spellY - 14 * s, ['Change spell', `${p.knownSpells.length} known`]);
+    } else if (Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
+      const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click a target';
+      drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [spell.name, `${spell.cost} mana · ${how} to cast`]);
+    }
   }
 
   // Potion belt beside the health orb.

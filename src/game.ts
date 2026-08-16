@@ -323,6 +323,11 @@ export class Game {
           this.drinkPotion();
           return true;
         }
+        const sb = layout.spellBtn;
+        if (mx >= sb.x && mx <= sb.x + sb.w && my >= sb.y && my <= sb.y + sb.h) {
+          this.toggleSpellMenu();
+          return true;
+        }
         if (Math.hypot(mx - layout.manaCx, my - layout.orbY) < layout.bezelR) {
           this.spellArmed = !this.spellArmed;
           return true;
@@ -332,17 +337,8 @@ export class Game {
     return false;
   }
 
-  /** Right-clicks on the satchel drop the row's item; a right-click on the
-   * mana orb opens the known-spell picker instead of casting. Returns true
-   * if consumed. */
+  /** Right-clicks on the satchel drop the row's item; returns true if consumed. */
   uiRightClick(mx: number, my: number, viewW: number, viewH: number): boolean {
-    if (this.screen === 'playing' && !this.invOpen) {
-      const layout = hudLayout(viewW, viewH);
-      if (Math.hypot(mx - layout.manaCx, my - layout.orbY) < layout.bezelR) {
-        this.spellMenuOpen = !this.spellMenuOpen;
-        return true;
-      }
-    }
     if (!this.invOpen) return false;
     const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
     if (mx < rect.x || mx > rect.x + rect.w || my < rect.y || my > rect.y + rect.h) return false;
