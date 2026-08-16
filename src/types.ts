@@ -116,6 +116,6 @@ export interface Projectile {
   vx: number; // tiles per second
   vy: number;
   ttl: number;
-  hostile?: boolean; // a Völva's bolt: hits the player, not enemies
+  hostile?: boolean; // a Lich's bolt: hits the player, not enemies
   dmg?: number;
 }

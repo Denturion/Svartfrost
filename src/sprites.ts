@@ -1,19 +1,25 @@
 // SpriteRenderer for the layered isometric_hero pack (public/isometric_hero/)
-// plus two matching monster packs (public/isometric_draugr/,
-// public/isometric_wretch/). All three ship with no in-repo docs, but all
-// three are confirmed (via OpenGameArt.org) to be Clint Bellanger's Flare
-// character art, CC-BY 3.0 — same 128x128px frame, same 8-direction grid,
+// plus six matching monster packs (public/isometric_draugr/, _wretch/,
+// _volva/, _brute/, _ratling/). All ship with no in-repo docs, but all are
+// confirmed (via OpenGameArt.org) to be Flare project art (Clint Bellanger,
+// or VWolfdog building on his base mesh/pipeline) — same 8-direction grid,
 // same render pipeline, so the same direction-row order applies to all of
-// them. Column layouts differ per pack (monsters weren't built with the
-// same animation set as the hero) and were read off the sheets themselves
-// via debug/spritesheet-viewer.html, not assumed from the hero's layout.
+// them. Frame size does NOT always match, though: most sheets are 128x128,
+// but the troll (brute) sheet is 256x256 — see EnemyPack.srcFrame, which
+// tintedFrame() reads at and draws down to the fixed 128px working size.
+// Column layouts differ per pack (monsters weren't built with the same
+// animation set as the hero) and were read off the sheets themselves via
+// filmstrip screenshots, not assumed from the hero's layout — though every
+// pack checked so far starts Stance(4)/Walk(8)/Attack(4) in that order, so
+// that part is high-confidence even where a pack's later segments aren't.
+// The rat sheet, CC-BY-SA 4.0 (Danimal, based on CDmir) — different terms
+// from the rest (ShareAlike) — used with the user's explicit go-ahead.
 //
 // Strictly additive: render.ts's existing procedural drawPlayer()/
 // drawEnemy() are left completely untouched and are still what draws any
-// entity kind not covered here — currently every enemy kind except
-// draugr/wretch (the monster packs on hand only cover those two). The call
-// site picks sprite vs. vector per entity, per frame, based on
-// playerSpritesReady()/enemySpritesReady() below.
+// entity kind not covered here (currently: boss). The call site picks
+// sprite vs. vector per entity, per frame, based on playerSpritesReady()/
+// enemySpritesReady() below.
 
 import { TILE_H, TILE_W } from './config';
 import type { Enemy, Player } from './types';
@@ -74,6 +80,46 @@ const WRETCH_SEGMENTS = {
   critDeath: { start: 28, len: 8 },
 } satisfies Record<string, Segment>;
 
+// Skeleton Mage (volva): 28 columns. Stance/Walk confirmed the same way as
+// every other pack; "attack" here is the staff thrust at cols 12-15 (this
+// mage has no separate melee weapon, so it's standing in for whatever pose
+// plays during a lunge) — cols 16-23 are some mix of a real cast pose and
+// a block/crouch that weren't worth pinning down further (see module doc).
+// The boss pack (Skeletal Occultist) below shares this exact layout —
+// same 28-column grid, same attack/hitDie columns, confirmed independently
+// rather than assumed, since it's built on the same base rig.
+const VOLVA_SEGMENTS = {
+  stance: { start: 0, len: 4 },
+  running: { start: 4, len: 8 },
+  attack: { start: 12, len: 4 },
+  hitDie: { start: 24, len: 4 }, // confirmed: fully collapsed by col 27 (only 4 frames here, not 6)
+} satisfies Record<string, Segment>;
+
+// Troll (brute), the one 256x256 sheet — see EnemyPack.srcFrame. Stance/
+// Walk/Attack confirmed (club windup at 12-13, strike at 14-15, same as
+// every other pack's attack timing). No collapse/death pose was found
+// anywhere in the 32 columns checked — hitDie below is a placeholder
+// (a crouched, weapon-lowered pose) rather than a confirmed death frame;
+// low stakes since it's only ever shown for the ~0.15s hit-flash today.
+const BRUTE_SEGMENTS = {
+  stance: { start: 0, len: 4 },
+  running: { start: 4, len: 8 },
+  attack: { start: 12, len: 4 },
+  hitDie: { start: 20, len: 4 },
+} satisfies Record<string, Segment>;
+
+// Rat (ratling), CC-BY-SA 4.0 — 42 columns. A much smaller, low-profile
+// model than the others, so poses read far more subtly frame to frame;
+// Stance/Walk/Attack are assumed from the same start/order every other
+// pack has used rather than independently confirmed. HitDie is real,
+// though — a visible blood pool appears under the rat starting ~col 24.
+const RATLING_SEGMENTS = {
+  stance: { start: 0, len: 4 },
+  running: { start: 4, len: 8 },
+  attack: { start: 12, len: 4 },
+  hitDie: { start: 22, len: 6 },
+} satisfies Record<string, Segment>;
+
 // --- atlas: every sheet the pack ships, loaded once at module init -------
 
 function load(src: string): HTMLImageElement {
@@ -96,6 +142,10 @@ const ATLAS = {
   head: load('/isometric_hero/male_head1.png'),
   skeleton: load('/isometric_draugr/skeleton_0.png'),
   zombie: load('/isometric_wretch/zombie_0.png'),
+  skeletonMage: load('/isometric_volva/skeleton_mage_high.png'),
+  troll: load('/isometric_brute/troll.png'),
+  rat: load('/isometric_ratling/rat_7.png'),
+  bossOccultist: load('/isometric_boss/skeleton_occultist.png'),
 };
 
 // Only 3 armor sheets and 4 blade sheets exist for the game's 6 armor tiers
@@ -122,14 +172,43 @@ interface EnemyPack {
   sheet: HTMLImageElement;
   segments: { stance: Segment; running: Segment; attack: Segment; hitDie: Segment };
   anchorYFrac: number;
+  srcFrame: number; // the sheet's own frame size — usually FRAME, but the troll sheet is 256px
 }
 
-// No drawShadow() call for either — like the hero, both sheets already
-// bake in their own drop shadow (visible directly in the source frames).
+// No drawShadow() call for any of these — like the hero, every sheet
+// already bakes in its own drop shadow (visible directly in the source
+// frames). Anchor fractions measured per pack (getImageData alpha-bounds
+// on each Stance frame) rather than assumed — troll in particular reads
+// noticeably higher (~0.70) than the slim-humanoid packs (~0.75-0.81).
 const ENEMY_PACKS: Partial<Record<Enemy['kind'], EnemyPack>> = {
-  draugr: { sheet: ATLAS.skeleton, segments: DRAUGR_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC },
-  wretch: { sheet: ATLAS.zombie, segments: WRETCH_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC },
+  draugr: { sheet: ATLAS.skeleton, segments: DRAUGR_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC, srcFrame: FRAME },
+  wretch: { sheet: ATLAS.zombie, segments: WRETCH_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC, srcFrame: FRAME },
+  volva: { sheet: ATLAS.skeletonMage, segments: VOLVA_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC, srcFrame: FRAME },
+  brute: { sheet: ATLAS.troll, segments: BRUTE_SEGMENTS, anchorYFrac: 0.7, srcFrame: 256 },
+  ratling: { sheet: ATLAS.rat, segments: RATLING_SEGMENTS, anchorYFrac: 0.85, srcFrame: FRAME },
+  // No dedicated boss art exists, so every boss shares this one sprite —
+  // BOSS_AURAS below (same colors as render.ts's BOSS_LOOKS) is what makes
+  // them read as different bosses instead of ten identical skeletons.
+  boss: { sheet: ATLAS.bossOccultist, segments: VOLVA_SEGMENTS, anchorYFrac: ANCHOR_Y_FRAC, srcFrame: FRAME },
 };
+
+// Duplicated from render.ts's BOSS_LOOKS (not imported — same reasoning as
+// drawShadow/drawRareSpikesLocal: render.ts already imports from this
+// module, importing back would cycle). Keep in sync if BOSS_LOOKS changes;
+// only the aura color is needed here, everything else about a boss's look
+// (head shape, horns, crown, per-boss quirks) is vector-only for now.
+const BOSS_AURAS = [
+  '170,180,195',
+  '190,60,70',
+  '159,213,235',
+  '150,160,170',
+  '100,110,130',
+  '150,200,230',
+  '120,140,90',
+  '191,227,245',
+  '170,160,210',
+  '190,200,225',
+];
 
 export function enemySpritesReady(e: Enemy): boolean {
   const pack = ENEMY_PACKS[e.kind];
@@ -249,11 +328,18 @@ function tintedFrame(
   b: number,
   warm: number,
   rareTint?: string, // "r,g,b" — same field render.ts's vector rare tint already uses
+  srcFrame: number = FRAME, // the sheet's own frame size (troll's is 256, not 128)
+  slowK = 0, // 0..~0.35, blend strength toward ice-blue while frost-slowed
 ): HTMLCanvasElement {
-  const sx = col * FRAME;
-  const sy = row * FRAME;
+  const sx = col * srcFrame;
+  const sy = row * srcFrame;
   rawCtx.clearRect(0, 0, FRAME, FRAME);
-  for (const img of layers) rawCtx.drawImage(img, sx, sy, FRAME, FRAME, 0, 0, FRAME, FRAME);
+  // Source and dest sizes can differ (e.g. 256 -> 128 for the troll sheet)
+  // — drawImage scales for us, and rawCtx's default imageSmoothingEnabled
+  // (never turned off in this module) keeps that downscale clean instead
+  // of blocky, which suits these Blender-rendered sheets better than
+  // nearest-neighbor would.
+  for (const img of layers) rawCtx.drawImage(img, sx, sy, srcFrame, srcFrame, 0, 0, FRAME, FRAME);
 
   const eff = Math.min(MAX_BRIGHTNESS, b * BRIGHTNESS_BOOST);
   // Same curve as shade() in config.ts, applied per-channel directly to the
@@ -271,6 +357,20 @@ function tintedFrame(
     rf *= 0.5 + 0.5 * (tr / 255);
     gf *= 0.5 + 0.5 * (tg / 255);
     bf *= 0.5 + 0.5 * (tb / 255);
+  }
+
+  // Frost-slowed: was a translucent ellipse floated on top of the sprite
+  // (ported straight from the vector renderer's local coordinates), which
+  // read as a stray glowing ball rather than a chill on the body, because
+  // that ellipse's position/size assumed the vector silhouette's
+  // proportions, not a sprite's. Blending the tint toward ice-blue instead
+  // (same technique as rareTint, just partial-strength) puts the frost
+  // *on* the actual pixels, so it can't float free of the art.
+  if (slowK > 0) {
+    const ICE: [number, number, number] = [150, 200, 225];
+    rf *= 1 - slowK + slowK * (ICE[0] / 255);
+    gf *= 1 - slowK + slowK * (ICE[1] / 255);
+    bf *= 1 - slowK + slowK * (ICE[2] / 255);
   }
 
   const imgData = rawCtx.getImageData(0, 0, FRAME, FRAME);
@@ -347,32 +447,46 @@ export function drawEnemySprite(
   const col = frameColumn(seg, time, fps);
   const { dx, dy } = enemyFacing(e);
   const row = directionRow(dx, dy);
-  const frame = tintedFrame([pack.sheet], col, row, brightness, warm, e.rare?.tint);
+  const slowK = Math.min(0.35, e.slowT * 0.18); // same curve the vector ellipse used to fade on
+  // No dedicated boss art — every boss shares the occultist sheet and is
+  // told apart by aura color only, same idea as a rare's tint (and reusing
+  // the same blend math).
+  const idTint = e.kind === 'boss' ? BOSS_AURAS[(e.bossId ?? 0) % BOSS_AURAS.length] : e.rare?.tint;
+  const frame = tintedFrame([pack.sheet], col, row, brightness, warm, idTint, pack.srcFrame, slowK);
 
-  // Same rare-mob size bump the vector renderer uses (see drawEnemy's
-  // `scale` local) — no boss/brute sprites yet, so only the rare case
-  // actually applies here today.
-  const scale = e.rare ? 1.2 : 1;
+  // Same size priority the vector renderer uses (see drawEnemy's `scale`
+  // local): boss > brute > rare > normal, not stacked.
+  const scale = e.kind === 'boss' ? 1.6 : e.kind === 'brute' ? 1.3 : e.rare ? 1.2 : 1;
   const dw = FRAME * scale;
   const dh = FRAME * scale;
   ctx.drawImage(frame, fx - dw / 2, fy - dh * pack.anchorYFrac, dw, dh);
 
-  // Status overlays — ported straight from drawEnemy's vector path, which
-  // draws these at a local (0,-12)-ish origin inside a translate(fx,fy) +
-  // scale(scale,scale) block; reproduced the same way here so a rare's
-  // spikes/tint ellipse and a slowed/bleeding/just-hit glow all line up
-  // with the sprite exactly like they do with the vector body.
-  if (e.rare || e.slowT > 0 || e.bleedT > 0 || e.flash > 0) {
+  // Boss aura ring at the feet — ported from drawEnemy's vector path
+  // (drawn at fx,fy directly, not translated/scaled, so it isn't exposed
+  // to the same "floated free of the body" problem the old slowT ellipse
+  // had). Flares faster and redder once enraged (<=30% hp).
+  if (e.kind === 'boss') {
+    const enraged = e.hp / e.maxHp <= 0.3;
+    const auraRgb = enraged ? '210,50,40' : BOSS_AURAS[(e.bossId ?? 0) % BOSS_AURAS.length];
+    const pulseHz = enraged ? 8 : 3;
+    ctx.strokeStyle = `rgba(${auraRgb},${(enraged ? 0.24 : 0.16) + 0.1 * Math.sin(time * pulseHz)})`;
+    ctx.lineWidth = enraged ? 2.2 : 1.5;
+    ctx.beginPath();
+    ctx.ellipse(fx, fy, 22 + Math.sin(time * pulseHz) * 2, 10, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Rare spikes + bleed droplets: small vector shapes drawn independent of
+  // whatever's underneath, so they still line up fine (they ring/drip near
+  // the body rather than assuming its exact silhouette). Slowed and
+  // just-hit feedback moved into the tint/pose instead — see slowK above
+  // and pickEnemySegment's flash->hitDie switch — since a translucent
+  // ellipse floated on top read as a stray ball, not a status effect.
+  if (e.rare || e.bleedT > 0) {
     ctx.save();
     ctx.translate(fx, fy);
     ctx.scale(scale, scale);
     if (e.rare) drawRareSpikesLocal(ctx, e.rare.seed);
-    if (e.slowT > 0) {
-      ctx.fillStyle = `rgba(150,200,225,${Math.min(0.35, e.slowT * 0.18)})`;
-      ctx.beginPath();
-      ctx.ellipse(0, -12, 10, 14, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
     if (e.bleedT > 0) {
       for (let i = 0; i < 3; i++) {
         const dropSeed = i * 47 + Math.floor(e.bleedT * 3);
@@ -383,12 +497,6 @@ export function drawEnemySprite(
         ctx.arc(bx, -10 + fall * 12, 1.3, 0, Math.PI * 2);
         ctx.fill();
       }
-    }
-    if (e.flash > 0) {
-      ctx.fillStyle = `rgba(230,235,242,${Math.min(0.6, e.flash * 4)})`;
-      ctx.beginPath();
-      ctx.ellipse(0, -12, 10, 13, 0, 0, Math.PI * 2);
-      ctx.fill();
     }
     ctx.restore();
   }

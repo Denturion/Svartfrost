@@ -57,8 +57,10 @@ const BASE_STATS = {
   wretch: { name: 'Wretch', hp: 8, dmgMin: 1, dmgMax: 3, speed: 3.2, attackCd: 0.9, sight: 8, xp: 6 },
   draugr: { name: 'Draugr', hp: 26, dmgMin: 4, dmgMax: 8, speed: 1.9, attackCd: 1.2, sight: 7, xp: 15 },
   boss: { name: 'Boss', hp: 90, dmgMin: 8, dmgMax: 14, speed: 2.3, attackCd: 1.4, sight: 10, xp: 120 },
-  // A seer that keeps its distance and lobs frost bolts instead of closing in.
-  volva: { name: 'Völva', hp: 15, dmgMin: 3, dmgMax: 6, speed: 2.0, attackCd: 1.7, sight: 9, xp: 14 },
+  // A skeletal caster that keeps its distance and lobs frost bolts instead
+  // of closing in. Named Völva until the sprite pass gave it a skeleton
+  // mage's look, which "Lich" fits much better.
+  volva: { name: 'Lich', hp: 15, dmgMin: 3, dmgMax: 6, speed: 2.0, attackCd: 1.7, sight: 9, xp: 14 },
   // A cluster monster: weak alone, dangerous in the pack it always spawns in.
   ratling: { name: 'Ratling', hp: 3, dmgMin: 1, dmgMax: 2, speed: 4.2, attackCd: 0.7, sight: 7, xp: 3 },
   // Slow and tanky, with a telegraphed slam instead of a normal swing.
