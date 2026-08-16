@@ -1,7 +1,8 @@
 import type { Game } from './game';
 import { getCamOffset, screenToWorldTile } from './render';
 import { initAudio, toggleMute, getVolume, setVolume } from './sound';
-import { pauseVolumeLayout } from './ui';
+import { hudLayout, pauseVolumeLayout } from './ui';
+import { isTouchDevice } from './device';
 
 export interface ViewSize {
   w: number;
@@ -19,6 +20,10 @@ export class Input {
   private keys = new Set<string>();
   private held = false;
   private holdT = 0;
+  // Touch has no right-click, so a long-press on the mana orb opens the
+  // spell picker instead — a short tap still arms the spell as before.
+  private orbPressTimer: ReturnType<typeof setTimeout> | null = null;
+  private orbLongPressed = false;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -60,6 +65,15 @@ export class Input {
       }
       if (ev.button !== 0) return;
       ev.preventDefault();
+      if (isTouchDevice && this.hitOrb(ev.clientX, ev.clientY)) {
+        this.orbLongPressed = false;
+        this.orbPressTimer = setTimeout(() => {
+          this.orbPressTimer = null;
+          this.orbLongPressed = true;
+          g.toggleSpellMenu();
+        }, 500);
+        return;
+      }
       if (g.uiClick(ev.clientX, ev.clientY, this.view.w, this.view.h)) return;
       if (g.spellArmed) {
         g.spellArmed = false;
@@ -73,10 +87,21 @@ export class Input {
       g.clickAt(tp.x, tp.y);
     });
     window.addEventListener('pointerup', (ev) => {
-      if (ev.button === 0) this.held = false;
+      if (ev.button !== 0) return;
+      this.held = false;
+      if (this.orbPressTimer !== null) {
+        clearTimeout(this.orbPressTimer);
+        this.orbPressTimer = null;
+        // The long-press never fired — treat it as the normal short tap.
+        if (!this.orbLongPressed) this.game.uiClick(ev.clientX, ev.clientY, this.view.w, this.view.h);
+      }
     });
     window.addEventListener('pointercancel', () => {
       this.held = false;
+      if (this.orbPressTimer !== null) {
+        clearTimeout(this.orbPressTimer);
+        this.orbPressTimer = null;
+      }
     });
     canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
     window.addEventListener('keydown', (ev) => {
@@ -130,6 +155,11 @@ export class Input {
   private mouseTile(): { x: number; y: number } {
     const { offX, offY } = getCamOffset(this.game, this.view.w, this.view.h);
     return screenToWorldTile(this.mouseX, this.mouseY, offX, offY, this.view.w, this.view.h);
+  }
+
+  private hitOrb(x: number, y: number): boolean {
+    const layout = hudLayout(this.view.w, this.view.h);
+    return Math.hypot(x - layout.manaCx, y - layout.orbY) < layout.bezelR;
   }
 
   update(dt: number): void {

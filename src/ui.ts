@@ -46,6 +46,35 @@ export function hudLayout(viewW: number, viewH: number): HudLayout {
   };
 }
 
+// Known-spell picker, opened by right-click/long-press on the mana orb.
+// Stacked as a small column of rows directly above the orb's spell-name
+// label so it reads as "that label, expanded" rather than a new surface.
+export interface SpellMenuMetrics {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rowH: number;
+  pad: number;
+}
+
+export function spellMenuLayout(viewW: number, viewH: number, count: number): SpellMenuMetrics {
+  const layout = hudLayout(viewW, viewH);
+  const s = layout.scale;
+  const w = 190 * s;
+  const rowH = 30 * s;
+  const pad = 8 * s;
+  const h = pad * 2 + rowH * Math.max(1, count);
+  return {
+    x: layout.manaCx - w / 2,
+    y: layout.orbY - layout.bezelR - 34 * s - h,
+    w,
+    h,
+    rowH,
+    pad,
+  };
+}
+
 // Satchel panel metrics, scaled the same way so it stays legible (and
 // tappable) on a short phone-landscape viewport instead of overflowing it.
 export interface InvMetrics {

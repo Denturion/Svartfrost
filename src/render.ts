@@ -28,7 +28,7 @@ import {
 import { describeItem, itemStatLine } from './items';
 import type { Item, Loot } from './items';
 import { isoX, isoY, screenToTile } from './iso';
-import { hudLayout, hudScale, invMetrics, invPanelRect, pauseVolumeLayout, titleMenu } from './ui';
+import { hudLayout, hudScale, invMetrics, invPanelRect, pauseVolumeLayout, spellMenuLayout, titleMenu } from './ui';
 import { isTouchDevice } from './device';
 import { getVolume } from './sound';
 import { SPELLS } from './spells';
@@ -4133,12 +4133,17 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   // Active spell above the mana orb — hover (or tap the orb) to see its cost.
   ctx.textAlign = 'center';
   ctx.font = `bold ${17 * s}px ${FONT_GOTHIC}`;
-  const spell = SPELLS[p.spell.spell ?? 'frostnova'];
+  const spell = SPELLS[p.activeSpell];
   const spellY = orbY - bezelR - 15 * s;
   fillTextPop(ctx, spell.name, manaCx, spellY);
-  if (Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
-    const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click';
-    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [spell.name, `${spell.cost} mana · ${how} to cast`]);
+  if (!game.spellMenuOpen && Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
+    const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click a target';
+    const switchHow = isTouchDevice ? 'hold the orb' : 'right-click the orb';
+    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [
+      spell.name,
+      `${spell.cost} mana · ${how} to cast`,
+      `${switchHow} to switch spell`,
+    ]);
   }
 
   // Potion belt beside the health orb.
@@ -4315,6 +4320,7 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   }
 
   if (game.invOpen) drawInventory(ctx, game, view);
+  if (game.spellMenuOpen) drawSpellMenu(ctx, game, view);
 
   // Banner.
   if (game.banner.t > 0) {
@@ -4361,6 +4367,45 @@ function itemAccent(loot: { kind: string }): string {
   }
 }
 
+/** Known-spell picker, opened by right-click/long-press on the mana orb
+ * (see game.ts's uiRightClick/toggleSpellMenu and input.ts's long-press). */
+function drawSpellMenu(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
+  const p = game.player;
+  const known = p.knownSpells;
+  const m = spellMenuLayout(view.w, view.h, known.length);
+  const s = hudScale(view.w, view.h);
+
+  ctx.fillStyle = 'rgba(8,10,14,0.92)';
+  ctx.fillRect(m.x, m.y, m.w, m.h);
+  ctx.strokeStyle = 'rgba(159,213,235,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(m.x, m.y, m.w, m.h);
+
+  for (let i = 0; i < known.length; i++) {
+    const id = known[i];
+    const ry = m.y + m.pad + i * m.rowH;
+    const active = id === p.activeSpell;
+    const hovered =
+      view.mouseX >= m.x && view.mouseX <= m.x + m.w && view.mouseY >= ry && view.mouseY < ry + m.rowH;
+    if (hovered) {
+      ctx.fillStyle = 'rgba(159,213,235,0.15)';
+      ctx.fillRect(m.x + 2, ry, m.w - 4, m.rowH);
+    }
+    ctx.fillStyle = active ? '#9fd5eb' : 'rgba(200,210,220,0.4)';
+    ctx.beginPath();
+    ctx.arc(m.x + m.pad + 3 * s, ry + m.rowH / 2, 3 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.textAlign = 'left';
+    ctx.font = `${15 * s}px ${FONT_GOTHIC}`;
+    fillTextPop(ctx, SPELLS[id].name, m.x + m.pad + 14 * s, ry + m.rowH / 2 + 5 * s, active ? '#eaf6fb' : '#c9ced6');
+    ctx.textAlign = 'right';
+    ctx.font = `${12 * s}px ${FONT_GOTHIC}`;
+    ctx.fillStyle = 'rgba(200,210,220,0.55)';
+    ctx.fillText(`${SPELLS[id].cost}`, m.x + m.w - m.pad, ry + m.rowH / 2 + 4 * s);
+  }
+  ctx.textAlign = 'left';
+}
+
 function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   const p = game.player;
   const s = hudScale(view.w, view.h);
@@ -4402,13 +4447,14 @@ function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): v
   drawInvertedCross(ctx, rect.x + rect.w - 30 * s, rect.y + 32 * s, 11 * s, 0.75);
 
   ctx.font = `${15 * s}px ${FONT_GOTHIC}`;
+  const activeSpell = SPELLS[p.activeSpell];
   const stats: [string, string][] = [
     ['Blade', describeItem(p.weapon)],
     ['Armor', p.armor ? describeItem(p.armor) : '—'],
     ['Charm', p.trinket ? describeItem(p.trinket) : '—'],
-    ['Spell', describeItem(p.spell)],
+    ['Spell', `${activeSpell.name}  ${activeSpell.cost} mana`],
   ];
-  const equipped: (Item | null)[] = [p.weapon, p.armor, p.trinket, p.spell];
+  const equipped: (Item | null)[] = [p.weapon, p.armor, p.trinket, null];
   const statValueMaxW = rect.w - m.pad * 2 - 62 * s;
   stats.forEach(([label, value], i) => {
     const ry = rect.y + 70 * s + i * 22 * s;
@@ -4468,9 +4514,10 @@ function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): v
       drawTooltipAbove(ctx, rect.x + rect.w / 2, ry, tipLines);
       ctx.textAlign = 'left';
 
+      // Tomes never land in inventory (picking one up teaches the spell and
+      // consumes it outright), so there's no 'tome' case left to compare.
       const equippedCounterpart =
         loot.kind === 'weapon' ? p.weapon :
-        loot.kind === 'tome' ? p.spell :
         loot.kind === 'armor' ? p.armor :
         loot.kind === 'trinket' ? p.trinket : null;
       drawCompareTooltip(ctx, rect.x - 10 * s, ry, loot, equippedCounterpart, s);
