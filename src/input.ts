@@ -115,6 +115,7 @@ export class Input {
         const tp = this.mouseTile();
         g.castSpell(tp.x, tp.y);
       }
+      if (k === 'e') g.cycleSpell();
       if (k === 'i') g.invOpen = !g.invOpen;
       if (MOVE_KEYS.has(k)) {
         this.keys.add(k);

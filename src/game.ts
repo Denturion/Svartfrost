@@ -10,7 +10,7 @@ import type { Records, RunSave } from './save';
 import { sfx, setMusicDepth } from './sound';
 import { SPELLS } from './spells';
 import type { SpellId } from './spells';
-import { hudLayout, invMetrics, invPanelRect, spellMenuLayout, titleMenu } from './ui';
+import { hudLayout, invMetrics, invPanelRect, titleMenu } from './ui';
 import { isTouchDevice } from './device';
 import type {
   Corpse,
@@ -28,7 +28,10 @@ import type {
 
 const ATTACK_RANGE = 1.5;
 const NOVA_RADIUS = 3.5;
-export const POTION_HEAL = 30;
+// A flat heal fell off fast as maxHp grew, so potions barely helped by the
+// time they mattered most — a % of the player's current maxHp instead.
+export const POTION_HEAL_PCT = 0.3;
+export const MANA_PICKUP_PCT = 0.3;
 const BELT_SIZE = 8;
 
 const BOSS_NAMES = [
@@ -86,9 +89,6 @@ export class Game {
   // Touch has no right-click to cast with, so tapping the mana orb "arms"
   // the spell — the next tap on the field casts there instead of moving.
   spellArmed = false;
-  // Right-click (or long-press, touch) the mana orb to pick which known
-  // spell is active, instead of casting — see uiRightClick()/uiClick().
-  spellMenuOpen = false;
   showFps = false;
   hurtFlash = 0;
   banner = { text: '', sub: '', t: 0 };
@@ -284,16 +284,6 @@ export class Game {
 
   /** Returns true if the click/tap landed on UI and should not reach the world. */
   uiClick(mx: number, my: number, viewW: number, viewH: number): boolean {
-    if (this.spellMenuOpen) {
-      const m = spellMenuLayout(viewW, viewH, this.player.knownSpells.length);
-      if (mx >= m.x && mx <= m.x + m.w && my >= m.y && my <= m.y + m.h) {
-        const row = Math.floor((my - m.y - m.pad) / m.rowH);
-        if (row >= 0 && row < this.player.knownSpells.length) this.selectSpell(this.player.knownSpells[row]);
-        return true;
-      }
-      this.spellMenuOpen = false;
-      return true;
-    }
     if (this.invOpen) {
       const rect = invPanelRect(viewW, viewH, this.player.inventory.length);
       if (mx >= rect.x && mx <= rect.x + rect.w && my >= rect.y && my <= rect.y + rect.h) {
@@ -325,7 +315,7 @@ export class Game {
         }
         const sb = layout.spellBtn;
         if (mx >= sb.x && mx <= sb.x + sb.w && my >= sb.y && my <= sb.y + sb.h) {
-          this.toggleSpellMenu();
+          this.cycleSpell();
           return true;
         }
         if (Math.hypot(mx - layout.manaCx, my - layout.orbY) < layout.bezelR) {
@@ -348,13 +338,12 @@ export class Game {
     return true;
   }
 
-  toggleSpellMenu(): void {
-    this.spellMenuOpen = !this.spellMenuOpen;
-  }
-
-  selectSpell(id: SpellId): void {
-    if (this.player.knownSpells.includes(id)) this.player.activeSpell = id;
-    this.spellMenuOpen = false;
+  /** "E" cycles the active spell through whatever's been learned this run. */
+  cycleSpell(): void {
+    const known = this.player.knownSpells;
+    if (known.length <= 1) return;
+    const i = known.indexOf(this.player.activeSpell);
+    this.player.activeSpell = known[(i + 1) % known.length];
   }
 
   equipFromInventory(index: number): void {
@@ -630,8 +619,9 @@ export class Game {
     const p = this.player;
     if (p.potions <= 0 || p.hp >= p.maxHp) return;
     p.potions--;
-    p.hp = Math.min(p.maxHp, p.hp + POTION_HEAL);
-    this.dmgNums.push({ x: p.x, y: p.y, value: `+${POTION_HEAL}`, t: 1, color: '#7a9c7a' });
+    const heal = Math.round(p.maxHp * POTION_HEAL_PCT);
+    p.hp = Math.min(p.maxHp, p.hp + heal);
+    this.dmgNums.push({ x: p.x, y: p.y, value: `+${heal}`, t: 1, color: '#7a9c7a' });
     sfx.potion();
   }
 
@@ -796,6 +786,13 @@ export class Game {
         if (p.potions >= BELT_SIZE) return true;
         p.potions++;
         this.dmgNums.push({ x: p.x, y: p.y, value: 'potion', t: 1, color: '#7a9c7a' });
+      } else if (g.loot === 'mana') {
+        // No belt slot for this one — it just tops mana up on touch, like
+        // a potion would if potions worked that way instead of being saved.
+        if (p.mana >= p.maxMana) return true;
+        const gain = Math.round(p.maxMana * MANA_PICKUP_PCT);
+        p.mana = Math.min(p.maxMana, p.mana + gain);
+        this.dmgNums.push({ x: p.x, y: p.y, value: `+${gain} mana`, t: 1, color: '#6ea8c9' });
       } else if (g.loot.kind === 'tome') {
         // A tome teaches its spell permanently (for this run) and is
         // consumed outright — it never occupies an inventory slot, so
@@ -913,8 +910,8 @@ export class Game {
     if (path) e.path = path;
   }
 
-  /** Völva: keeps its distance and lobs a hostile frost bolt when the
-   * player sits in its comfortable cast range. */
+  /** Lich (kind: 'volva'): keeps its distance and lobs a hostile frost
+   * bolt when the player sits in its comfortable cast range. */
   private updateVolva(e: Enemy, dt: number, dist: number, slowMul: number): void {
     const p = this.player;
     const KEEP_DIST = 3.5;

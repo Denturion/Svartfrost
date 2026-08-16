@@ -251,7 +251,10 @@ function maybeLegendary(depth: number, boosted: boolean): Item | null {
   return rollLegendaryItem();
 }
 
-export type Loot = Item | 'potion';
+// 'mana' is the same kind of instant pickup as 'potion' — no belt slot,
+// consumed on touch (see game.ts's ground-loot pickup loop) — just topping
+// up mana instead of hp.
+export type Loot = Item | 'potion' | 'mana';
 
 export function rollDrops(depth: number, boss: boolean): Loot[] {
   const pastGrayFloor = depth > 10;
@@ -269,10 +272,11 @@ export function rollDrops(depth: number, boss: boolean): Loot[] {
   }
   const r = Math.random();
   if (r < 0.2) return ['potion'];
-  if (r < 0.27) return [maybeEnchant(itemOfTier('weapon', rollTier(depth, 'weapon')), false, pastGrayFloor)];
-  if (r < 0.34) return [maybeEnchant(itemOfTier('armor', rollTier(depth, 'armor')), false, pastGrayFloor)];
-  if (r < 0.385) return [maybeEnchant(itemOfTier('trinket', rollTier(depth, 'trinket')), false, pastGrayFloor)];
-  if (r < 0.425) return [itemOfTier('tome', rollTier(depth, 'tome'))];
+  if (r < 0.32) return ['mana'];
+  if (r < 0.39) return [maybeEnchant(itemOfTier('weapon', rollTier(depth, 'weapon')), false, pastGrayFloor)];
+  if (r < 0.46) return [maybeEnchant(itemOfTier('armor', rollTier(depth, 'armor')), false, pastGrayFloor)];
+  if (r < 0.515) return [maybeEnchant(itemOfTier('trinket', rollTier(depth, 'trinket')), false, pastGrayFloor)];
+  if (r < 0.555) return [itemOfTier('tome', rollTier(depth, 'tome'))];
   return [];
 }
 

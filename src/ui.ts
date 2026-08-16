@@ -48,37 +48,11 @@ export function hudLayout(viewW: number, viewH: number): HudLayout {
     satchelBtn: { x: btnR + 16 * scale, y: btnR + 16 * scale, r: btnR },
     pauseBtn: { x: btnR + 16 * scale, y: btnR * 3 + 30 * scale, r: btnR },
     // The active-spell name, sitting above the mana orb, doubles as a
-    // button — click it to open the known-spell picker (see spellMenuLayout).
+    // button — click/tap it to cycle to the next known spell (same action
+    // "E" triggers on desktop; see game.ts's cycleSpell()). A dropdown menu
+    // here didn't work out (hit-testing/closing it was unreliable), so this
+    // is deliberately a single dumb action with no extra open/close state.
     spellBtn: { x: manaCx - spellBtnW / 2, y: spellY - spellBtnH * 0.7, w: spellBtnW, h: spellBtnH },
-  };
-}
-
-// Known-spell picker, opened by right-click/long-press on the mana orb.
-// Stacked as a small column of rows directly above the orb's spell-name
-// label so it reads as "that label, expanded" rather than a new surface.
-export interface SpellMenuMetrics {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  rowH: number;
-  pad: number;
-}
-
-export function spellMenuLayout(viewW: number, viewH: number, count: number): SpellMenuMetrics {
-  const layout = hudLayout(viewW, viewH);
-  const s = layout.scale;
-  const w = 190 * s;
-  const rowH = 30 * s;
-  const pad = 8 * s;
-  const h = pad * 2 + rowH * Math.max(1, count);
-  return {
-    x: layout.manaCx - w / 2,
-    y: layout.orbY - layout.bezelR - 34 * s - h,
-    w,
-    h,
-    rowH,
-    pad,
   };
 }
 

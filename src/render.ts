@@ -14,7 +14,7 @@ import {
 import { Tile } from './dungeon';
 import type { Dungeon } from './dungeon';
 import type { Game } from './game';
-import { POTION_HEAL } from './game';
+import { POTION_HEAL_PCT } from './game';
 import {
   floorImg,
   playerClothImg,
@@ -28,7 +28,7 @@ import {
 import { describeItem, itemStatLine } from './items';
 import type { Item, Loot } from './items';
 import { isoX, isoY, screenToTile } from './iso';
-import { hudLayout, hudScale, invMetrics, invPanelRect, pauseVolumeLayout, spellMenuLayout, titleMenu } from './ui';
+import { hudLayout, hudScale, invMetrics, invPanelRect, pauseVolumeLayout, titleMenu } from './ui';
 import { isTouchDevice } from './device';
 import { getVolume } from './sound';
 import { SPELLS } from './spells';
@@ -1434,10 +1434,10 @@ function drawGroundItem(
 ): void {
   ctx.globalAlpha = alpha;
   const pulse = 0.6 + 0.4 * Math.sin(time * 3 + cx * 0.13);
-  const rc = loot !== 'potion' ? rarityColor(loot) : null;
-  const glowColor = loot === 'potion' ? '160,40,45' : rc ? hexRgbTriple(rc) : '200,215,230';
+  const rc = rarityColor(loot);
+  const glowColor = loot === 'potion' ? '160,40,45' : loot === 'mana' ? '70,120,170' : rc ? hexRgbTriple(rc) : '200,215,230';
   const glowAlpha = rc ? 0.34 : 0.22;
-  const glowR = loot !== 'potion' && loot.rarity === 'legendary' ? 20 : 15;
+  const glowR = loot !== 'potion' && loot !== 'mana' && loot.rarity === 'legendary' ? 20 : 15;
   const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, glowR);
   glow.addColorStop(0, `rgba(${glowColor},${glowAlpha * pulse})`);
   glow.addColorStop(1, `rgba(${glowColor},0)`);
@@ -1452,6 +1452,19 @@ function drawGroundItem(
     ctx.fillStyle = '#22252a';
     ctx.fillRect(cx - 1.5, cy - 12, 3, 5);
     ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.beginPath();
+    ctx.ellipse(cx - 1.5, cy - 4.5, 1.2, 2, -0.4, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (loot === 'mana') {
+    // Same flask silhouette as the potion, blue glass instead of red so
+    // the two read as a pair at a glance.
+    ctx.fillStyle = '#122c47';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy - 3, 4, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#22252a';
+    ctx.fillRect(cx - 1.5, cy - 12, 3, 5);
+    ctx.fillStyle = 'rgba(180,215,255,0.3)';
     ctx.beginPath();
     ctx.ellipse(cx - 1.5, cy - 4.5, 1.2, 2, -0.4, 0, Math.PI * 2);
     ctx.fill();
@@ -3395,7 +3408,7 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
   for (const pr of game.projectiles) {
     const cx = offX + isoX(pr.x, pr.y);
     const cy = offY + isoY(pr.x, pr.y) + HH - 14;
-    // A Völva's bolt reads cold (icy blue) instead of the player's warm
+    // A Lich's bolt reads cold (icy blue) instead of the player's warm
     // fireball, so the player can tell at a glance who threw it.
     const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, 10);
     if (pr.hostile) {
@@ -4132,8 +4145,8 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
     ctx.stroke();
   }
 
-  // Active spell above the mana orb — also a button: click/tap it to open
-  // the known-spell picker (layout.spellBtn, handled in game.ts's uiClick).
+  // Active spell above the mana orb — also a button: click/tap it (or press
+  // E) to cycle to the next known spell (game.ts's cycleSpell()).
   const spell = SPELLS[p.activeSpell];
   const spellY = orbY - bezelR - 15 * s;
   const sb = layout.spellBtn;
@@ -4148,13 +4161,11 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   ctx.textAlign = 'center';
   ctx.font = `bold ${17 * s}px ${FONT_GOTHIC}`;
   fillTextPop(ctx, spell.name, manaCx, spellY);
-  if (!game.spellMenuOpen) {
-    if (spellBtnHovered) {
-      drawTooltipAbove(ctx, manaCx, spellY - 14 * s, ['Change spell', `${p.knownSpells.length} known`]);
-    } else if (Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
-      const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click a target';
-      drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [spell.name, `${spell.cost} mana · ${how} to cast`]);
-    }
+  if (spellBtnHovered) {
+    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, ['E (or click) to switch spell', `${p.knownSpells.length} known`]);
+  } else if (Math.hypot(view.mouseX - manaCx, view.mouseY - orbY) < bezelR + 4) {
+    const how = isTouchDevice ? 'tap the orb, then the field' : 'right-click a target';
+    drawTooltipAbove(ctx, manaCx, spellY - 14 * s, [spell.name, `${spell.cost} mana · ${how} to cast`]);
   }
 
   // Potion belt beside the health orb.
@@ -4175,7 +4186,8 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   ctx.fillStyle = 'rgba(200,206,214,0.8)';
   ctx.fillText('Q', bx - 4 * s, by + 30 * s);
   if (Math.hypot(view.mouseX - bx, view.mouseY - by) < potionR + 4) {
-    drawTooltipAbove(ctx, bx, by - 16 * s, ['Potion', `restores ${POTION_HEAL} HP · Q to quaff`]);
+    const potionHeal = Math.round(p.maxHp * POTION_HEAL_PCT);
+    drawTooltipAbove(ctx, bx, by - 16 * s, ['Potion', `restores ${Math.round(POTION_HEAL_PCT * 100)}% HP (${potionHeal}) · Q to quaff`]);
   }
 
   // Depth marker, on an iron plate so it reads over any floor beneath it.
@@ -4331,7 +4343,6 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
   }
 
   if (game.invOpen) drawInventory(ctx, game, view);
-  if (game.spellMenuOpen) drawSpellMenu(ctx, game, view);
 
   // Banner.
   if (game.banner.t > 0) {
@@ -4355,8 +4366,8 @@ function drawHud(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
 // Diablo-style rarity coloring: undecorated white/gray for a plain drop,
 // blue for a single-affix magic item, gold for a 2-3 affix rare — so the
 // player can tell a good drop apart from junk without reading the tooltip.
-function rarityColor(loot: { rarity?: 'magic' | 'rare' | 'legendary' } | 'potion'): string | null {
-  if (loot === 'potion') return null;
+function rarityColor(loot: { rarity?: 'magic' | 'rare' | 'legendary' } | 'potion' | 'mana'): string | null {
+  if (loot === 'potion' || loot === 'mana') return null;
   if (loot.rarity === 'legendary') return '#e0453f';
   if (loot.rarity === 'rare') return '#e0b64a';
   if (loot.rarity === 'magic') return '#6fa8dc';
@@ -4376,45 +4387,6 @@ function itemAccent(loot: { kind: string }): string {
     default:
       return '#8b9099';
   }
-}
-
-/** Known-spell picker, opened by right-click/long-press on the mana orb
- * (see game.ts's uiRightClick/toggleSpellMenu and input.ts's long-press). */
-function drawSpellMenu(ctx: CanvasRenderingContext2D, game: Game, view: View): void {
-  const p = game.player;
-  const known = p.knownSpells;
-  const m = spellMenuLayout(view.w, view.h, known.length);
-  const s = hudScale(view.w, view.h);
-
-  ctx.fillStyle = 'rgba(8,10,14,0.92)';
-  ctx.fillRect(m.x, m.y, m.w, m.h);
-  ctx.strokeStyle = 'rgba(159,213,235,0.4)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(m.x, m.y, m.w, m.h);
-
-  for (let i = 0; i < known.length; i++) {
-    const id = known[i];
-    const ry = m.y + m.pad + i * m.rowH;
-    const active = id === p.activeSpell;
-    const hovered =
-      view.mouseX >= m.x && view.mouseX <= m.x + m.w && view.mouseY >= ry && view.mouseY < ry + m.rowH;
-    if (hovered) {
-      ctx.fillStyle = 'rgba(159,213,235,0.15)';
-      ctx.fillRect(m.x + 2, ry, m.w - 4, m.rowH);
-    }
-    ctx.fillStyle = active ? '#9fd5eb' : 'rgba(200,210,220,0.4)';
-    ctx.beginPath();
-    ctx.arc(m.x + m.pad + 3 * s, ry + m.rowH / 2, 3 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.textAlign = 'left';
-    ctx.font = `${15 * s}px ${FONT_GOTHIC}`;
-    fillTextPop(ctx, SPELLS[id].name, m.x + m.pad + 14 * s, ry + m.rowH / 2 + 5 * s, active ? '#eaf6fb' : '#c9ced6');
-    ctx.textAlign = 'right';
-    ctx.font = `${12 * s}px ${FONT_GOTHIC}`;
-    ctx.fillStyle = 'rgba(200,210,220,0.55)';
-    ctx.fillText(`${SPELLS[id].cost}`, m.x + m.w - m.pad, ry + m.rowH / 2 + 4 * s);
-  }
-  ctx.textAlign = 'left';
 }
 
 function drawInventory(ctx: CanvasRenderingContext2D, game: Game, view: View): void {

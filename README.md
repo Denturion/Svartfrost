@@ -23,7 +23,7 @@ see "Entities" under Rendering & performance below.
 - Photo-textured stone, ice, leather, and skin, warped onto the iso
   tile/wall/monster geometry and cached per tile so lighting stays fully
   dynamic
-- Six enemy kinds beyond the plain wretch/draugr: the Völva (a caster that
+- Six enemy kinds beyond the plain wretch/draugr: the Lich (a caster that
   keeps its distance and lobs frost bolts), Ratlings (weak but always
   spawn in a pack), the Barrow Brute (telegraphs a slam you can dodge),
   plus depth-gated "rare" unique variants with stat boosts and a spikier,
