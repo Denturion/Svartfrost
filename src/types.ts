@@ -45,6 +45,7 @@ export interface Enemy extends Entity {
 }
 
 export interface Player extends Entity {
+  castT: number; // 1 -> 0, brief hold after casting a spell (drives the cast animation)
   regen: number; // hp per second
   mana: number;
   maxMana: number;

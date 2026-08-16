@@ -18,6 +18,7 @@ export function createPlayer(x: number, y: number): Player {
     lungeDX: 1,
     lungeDY: 0,
     flash: 0,
+    castT: 0,
     regen: 0.6,
     mana: 40,
     maxMana: 40,

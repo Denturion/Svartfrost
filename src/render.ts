@@ -34,6 +34,7 @@ import { getVolume } from './sound';
 import { SPELLS } from './spells';
 import { xpNext } from './entities';
 import type { Enemy, Player } from './types';
+import { drawPlayerSprite, playerSpritesReady } from './sprites';
 
 const HW = TILE_W / 2;
 const HH = TILE_H / 2;
@@ -511,6 +512,41 @@ function drawFloorDecor(ctx: CanvasRenderingContext2D, px: number, py: number, x
     ctx.stroke();
   }
 
+  // Dried blood — its own independent roll (not part of the h2 chain above)
+  // so it can turn up on a tile regardless of whatever else landed there.
+  if (tileHash(x * 31 + 7, y * 37 + 13) > 0.93 && b > 0.05) {
+    const bx = cx + (tileHash(x + 5, y + 41) - 0.5) * 14;
+    const by = cy + (tileHash(x + 41, y + 5) - 0.5) * 6;
+    const rot = tileHash(x * 2 + 1, y * 2 + 1) * Math.PI;
+    ctx.fillStyle = `rgba(72,16,14,${0.25 + b * 0.35})`;
+    ctx.beginPath();
+    ctx.ellipse(bx, by, 4.5, 2.6, rot, 0, Math.PI * 2);
+    ctx.fill();
+    // A couple of spatter droplets flung clear of the main pool.
+    for (let i = 0; i < 2; i++) {
+      const dx = bx + Math.cos(rot + i * 2.3) * (6 + i * 2);
+      const dy = by + Math.sin(rot + i * 2.3) * (2.5 + i);
+      ctx.beginPath();
+      ctx.arc(dx, dy, 0.9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Dirt/grime — another independent roll, a duller and larger smudge than
+  // the blood above so the two read as different kinds of mess.
+  if (tileHash(x * 43 + 3, y * 47 + 9) > 0.9 && b > 0.05) {
+    const gx = cx + (tileHash(x + 9, y + 53) - 0.5) * 16;
+    const gy = cy + (tileHash(x + 53, y + 9) - 0.5) * 7;
+    ctx.fillStyle = `rgba(40,34,26,${0.12 + b * 0.16})`;
+    ctx.beginPath();
+    ctx.ellipse(gx, gy, 8, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = `rgba(30,26,20,${0.1 + b * 0.14})`;
+    ctx.beginPath();
+    ctx.ellipse(gx - 4, gy + 1.5, 4, 2.2, 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   // Ambient occlusion: floors darken along wall-adjacent edges.
   if (ao !== 0) {
     ctx.fillStyle = 'rgba(0,0,0,0.2)';
@@ -621,8 +657,9 @@ interface WallStyle {
   torch: 'sw' | 'se' | null;
   time: number | null;
   jit: [number, number][]; // per-corner offsets: N, E, S, W
-  variant: 'brick' | 'strata' | 'rune' | 'bones';
+  variant: 'brick' | 'strata' | 'rune';
   stain: boolean;
+  blood: boolean;
   accFace: 0 | 1; // which face (0 SW, 1 SE) carries rune/bone accents
 }
 
@@ -660,13 +697,13 @@ function computeWallStyle(
   ];
   const torch = d.torches.find((t) => t.x === x && t.y === y)?.side ?? null;
   // Masonry variants: strata bands come from a coarse regional hash so whole
-  // stretches read as older rock; runes and bone niches are rare accents.
+  // stretches read as older rock; carved sigils (runes, or a pentagram —
+  // see WALL_SIGILS) are a rare accent.
   const v2 = tileHash(x * 3 + 11, y * 5 + 7);
   const region = tileHash((x >> 2) * 9 + 1, (y >> 2) * 13 + 6);
   let variant: WallStyle['variant'] = 'brick';
   if (!pillar && !ruined) {
-    if (v2 < 0.05) variant = 'bones';
-    else if (v2 < 0.11) variant = 'rune';
+    if (v2 < 0.11) variant = 'rune';
     else if (region < 0.3) variant = 'strata';
   }
   // Accents belong on a face with open floor before it, or they'd be buried.
@@ -691,6 +728,7 @@ function computeWallStyle(
     jit,
     variant,
     stain: !pillar && tileHash(x * 17 + 2, y * 19 + 3) > 0.84,
+    blood: !pillar && tileHash(x * 23 + 5, y * 29 + 11) > 0.92,
     accFace,
   };
 }
@@ -719,6 +757,14 @@ const WALL_SIGILS: [number, number, number, number][][] = [
   [
     [0.45, 0.25, 0.45, 0.75],
     [0.45, 0.55, 0.62, 0.68],
+  ],
+  // A pentagram, traced as one continuous five-line star.
+  [
+    [0.5, 0.22, 0.665, 0.727],
+    [0.665, 0.727, 0.234, 0.413],
+    [0.234, 0.413, 0.766, 0.413],
+    [0.766, 0.413, 0.335, 0.727],
+    [0.335, 0.727, 0.5, 0.22],
   ],
 ];
 
@@ -905,33 +951,6 @@ function drawWallDecor(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
       }
       ctx.stroke();
     }
-  } else if (ws.variant === 'bones') {
-    // A niche stacked with the dead.
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    faceQuad(accFace, 0.24, 0.22, 0.76, 0.66);
-    ctx.fill();
-    const [cxp, cyp] = accPt(0.5, 0.5);
-    const pale = `rgba(188,192,198,${Math.min(0.85, 0.25 + bj * 0.8)})`;
-    // Crossed long bones behind the skull.
-    ctx.strokeStyle = pale;
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    ctx.moveTo(cxp - 6, cyp + 4);
-    ctx.lineTo(cxp + 6, cyp - 3);
-    ctx.moveTo(cxp + 6, cyp + 4);
-    ctx.lineTo(cxp - 6, cyp - 3);
-    ctx.stroke();
-    // The skull.
-    ctx.fillStyle = pale;
-    ctx.beginPath();
-    ctx.arc(cxp, cyp - 1, 3.1, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillRect(cxp - 1.8, cyp + 1.4, 3.6, 1.6);
-    ctx.fillStyle = 'rgba(10,10,14,0.9)';
-    ctx.beginPath();
-    ctx.arc(cxp - 1.2, cyp - 1.4, 0.9, 0, Math.PI * 2);
-    ctx.arc(cxp + 1.2, cyp - 1.4, 0.9, 0, Math.PI * 2);
-    ctx.fill();
   }
 
   if (ws.stain) {
@@ -946,6 +965,33 @@ function drawWallDecor(ctx: CanvasRenderingContext2D, ws: WallStyle): void {
       const [sb0x, sb0y, sb1x, sb1y] = faces[fi2];
       const top = facePt(sb0x, sb0y, sb1x, sb1y, u, 0.98, hgt);
       const bot = facePt(sb0x, sb0y, sb1x, sb1y, u + 0.03, 0.98 - len, hgt);
+      ctx.moveTo(top[0], top[1]);
+      ctx.lineTo(bot[0], bot[1]);
+    }
+    ctx.stroke();
+  }
+
+  if (ws.blood) {
+    // A dark, dried spatter with a couple of drips running down from it —
+    // same drip technique as the water stain above, just a rustier tone
+    // and starting partway down the face instead of from the top.
+    const fi2 = accFace;
+    const [bb0x, bb0y, bb1x, bb1y] = faces[fi2];
+    const bu = 0.3 + tileHash((px + 41) | 0, 17) * 0.4;
+    const bf = 0.55 + tileHash(19, (px + 7) | 0) * 0.2;
+    const [bcx, bcy] = facePt(bb0x, bb0y, bb1x, bb1y, bu, bf, hgt);
+    ctx.fillStyle = `rgba(64,14,12,${0.3 + bj * 0.35})`;
+    ctx.beginPath();
+    ctx.ellipse(bcx, bcy, 3.2, 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(50,10,9,${0.25 + bj * 0.3})`;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    for (let s = 0; s < 2; s++) {
+      const du = bu + (s - 0.5) * 0.05;
+      const len = 0.12 + tileHash(s * 29 + 3, (px * 5) | 0) * 0.18;
+      const top = facePt(bb0x, bb0y, bb1x, bb1y, du, bf, hgt);
+      const bot = facePt(bb0x, bb0y, bb1x, bb1y, du + 0.015, bf - len, hgt);
       ctx.moveTo(top[0], top[1]);
       ctx.lineTo(bot[0], bot[1]);
     }
@@ -3119,6 +3165,7 @@ interface DrawSlot {
   fx: number;
   fy: number;
   b: number;
+  warm: number;
   p: Player | null;
   pfx: number;
   pfy: number;
@@ -3129,7 +3176,7 @@ let drawCount = 0;
 
 function nextDrawSlot(): DrawSlot {
   if (drawCount === drawPool.length) {
-    drawPool.push({ depth: 0, kind: 0, ws: null, e: null, fx: 0, fy: 0, b: 0, p: null, pfx: 0, pfy: 0 });
+    drawPool.push({ depth: 0, kind: 0, ws: null, e: null, fx: 0, fy: 0, b: 0, warm: 0, p: null, pfx: 0, pfy: 0 });
   }
   return drawPool[drawCount++];
 }
@@ -3161,7 +3208,8 @@ function drawSlot(ctx: CanvasRenderingContext2D, game: Game, s: DrawSlot): void 
       drawEnemy(ctx, s.fx, s.fy, s.e!, s.b, game.time);
       break;
     case 2:
-      drawPlayer(ctx, s.pfx, s.pfy, s.p!, game.time);
+      if (playerSpritesReady(s.p!)) drawPlayerSprite(ctx, s.pfx, s.pfy, s.p!, game.time, s.b, s.warm);
+      else drawPlayer(ctx, s.pfx, s.pfy, s.p!, game.time);
       break;
   }
 }
@@ -3334,6 +3382,8 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
     s.p = p;
     s.pfx = pfx;
     s.pfy = pfy;
+    s.b = lightAt(game, p.x, p.y);
+    s.warm = outWarm;
   }
 
   sortDrawPool();

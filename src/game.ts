@@ -477,6 +477,7 @@ export class Game {
     if (this.novaCd > 0 || p.mana < SPELLS[id].cost) return;
     p.mana -= SPELLS[id].cost;
     this.novaCd = 0.6;
+    p.castT = 1;
 
     // Aim direction for targeted spells.
     let dx = tileX - p.x;
@@ -489,6 +490,8 @@ export class Game {
       dx /= dlen;
       dy /= dlen;
     }
+    p.lungeDX = dx;
+    p.lungeDY = dy;
 
     switch (id) {
       case 'frostnova':
@@ -701,6 +704,7 @@ export class Game {
     const p = this.player;
     p.attackTimer = Math.max(0, p.attackTimer - dt);
     p.lunge = Math.max(0, p.lunge - dt * 4);
+    p.castT = Math.max(0, p.castT - dt * 4);
     p.flash = Math.max(0, p.flash - dt);
     p.hp = Math.min(p.maxHp, p.hp + p.regen * dt);
     p.mana = Math.min(p.maxMana, p.mana + p.manaRegen * dt);
