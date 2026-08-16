@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8" />
+<title>Spritesheet Viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+    background: #1b1c22;
+    color: #e8e8ee;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  header {
+    padding: 10px 14px;
+    background: #24252d;
+    border-bottom: 1px solid #3a3b47;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: center;
+    font-size: 13px;
+  }
+  header label { display: flex; align-items: center; gap: 6px; }
+  select, button, input[type=range] { font: inherit; }
+  select {
+    background: #14151a; color: #e8e8ee; border: 1px solid #4546555;
+    border-radius: 4px; padding: 3px 6px;
+  }
+  button {
+    background: #3a3b47; color: #e8e8ee; border: 1px solid #55566a;
+    border-radius: 4px; padding: 4px 10px; cursor: pointer;
+  }
+  button:hover { background: #4a4c5c; }
+  button.active { background: #5a7dff; border-color: #7d99ff; }
+  main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  #sheetPane {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+    background:
+      linear-gradient(45deg, #26272f 25%, transparent 25%) 0 0 / 20px 20px,
+      linear-gradient(-45deg, #26272f 25%, transparent 25%) 0 0 / 20px 20px,
+      linear-gradient(45deg, transparent 75%, #26272f 75%) 0 0 / 20px 20px,
+      linear-gradient(-45deg, transparent 75%, #26272f 75%) 0 0 / 20px 20px,
+      #1e1f26;
+    padding: 20px;
+  }
+  #sheetWrap { position: relative; display: inline-block; }
+  #sheetImg { display: block; image-rendering: pixelated; }
+  #gridCanvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+  aside {
+    width: 340px;
+    flex-shrink: 0;
+    background: #24252d;
+    border-left: 1px solid #3a3b47;
+    padding: 14px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #preview {
+    width: 300px;
+    height: 300px;
+    background-color: #14151a;
+    background-repeat: no-repeat;
+    image-rendering: pixelated;
+    border: 1px solid #45465a;
+    border-radius: 4px;
+    margin: 0 auto;
+  }
+  .row { display: flex; gap: 8px; align-items: center; justify-content: center; flex-wrap: wrap; }
+  .info { font-size: 12px; line-height: 1.6; color: #b7b8c4; }
+  .info b { color: #e8e8ee; }
+  h3 { margin: 4px 0 2px; font-size: 13px; color: #9fb0ff; }
+  .segList { display: flex; flex-direction: column; gap: 4px; }
+  .segBtn {
+    text-align: left; background: #14151a; border: 1px solid #35364433;
+  }
+  .segBtn.active { background: #5a7dff; }
+  code { background: #14151a; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <label>Fil:
+    <select id="fileSelect"></select>
+  </label>
+  <label>Riktning (rad):
+    <select id="rowSelect"></select>
+  </label>
+  <label>Zoom:
+    <input type="range" id="zoom" min="0.15" max="1" step="0.05" value="0.35" />
+    <span id="zoomVal"></span>
+  </label>
+  <label>FPS:
+    <input type="range" id="fps" min="1" max="24" step="1" value="8" />
+    <span id="fpsVal"></span>
+  </label>
+  <span class="info">Frame 128×128px · 32 kolumner × 8 rader (härlett från 4096×1024 + skaparens angivna 128px-frames)</span>
+</header>
+<main>
+  <div id="sheetPane">
+    <div id="sheetWrap">
+      <img id="sheetImg" />
+      <canvas id="gridCanvas"></canvas>
+    </div>
+  </div>
+  <aside>
+    <h3>Frame-förhandsvisning</h3>
+    <div id="preview"></div>
+    <div class="row">
+      <button id="prevBtn">◀ Prev</button>
+      <button id="playBtn">▶ Play</button>
+      <button id="nextBtn">Next ▶</button>
+    </div>
+    <div class="info" id="frameInfo"></div>
+
+    <h3>Animationssegment (kolumner enligt skaparen)</h3>
+    <div class="segList" id="segList"></div>
+
+    <h3>Genväg</h3>
+    <div class="info">
+      Piltangenter ←/→ byter frame inom sheeten (fri, ej begränsad till segment).<br/>
+      Piltangenter ↑/↓ byter riktning (rad) på samma kolumn — bra för att verifiera
+      att raderna verkligen motsvarar 8 olika riktningar i rimlig ordning.
+    </div>
+
+    <h3>Not</h3>
+    <div class="info">
+      Skaparens riktningsordning per rad är <b>inte</b> dokumenterad någonstans i paketet.
+      Använd denna vy för att själv notera vilken rad som är vilken riktning
+      (t.ex. rad 0 = söder, rad 1 = sydväst, osv) innan vi hårdkodar det i spelet.
+    </div>
+  </aside>
+</main>
+
+<script>
+const FILES = [
+  'buckler', 'clothes', 'dagger', 'greatbow', 'greatstaff', 'greatsword',
+  'leather_armor', 'longbow', 'longsword', 'male_head1', 'male_head2',
+  'male_head3', 'rod', 'shield', 'shortbow', 'shortsword', 'slingshot',
+  'staff', 'steel_armor', 'wand',
+];
+const FRAME = 128;
+const COLS = 32;
+const ROWS = 8;
+const SEGMENTS = [
+  { name: 'Stance', start: 0, len: 4 },
+  { name: 'Running', start: 4, len: 8 },
+  { name: 'Melee Swing', start: 12, len: 4 },
+  { name: 'Block', start: 16, len: 2 },
+  { name: 'Hit and Die', start: 18, len: 6 },
+  { name: 'Cast Spell', start: 24, len: 4 },
+  { name: 'Shoot Bow', start: 28, len: 4 },
+];
+
+const fileSelect = document.getElementById('fileSelect');
+const rowSelect = document.getElementById('rowSelect');
+const zoomInput = document.getElementById('zoom');
+const zoomVal = document.getElementById('zoomVal');
+const fpsInput = document.getElementById('fps');
+const fpsVal = document.getElementById('fpsVal');
+const sheetImg = document.getElementById('sheetImg');
+const gridCanvas = document.getElementById('gridCanvas');
+const preview = document.getElementById('preview');
+const frameInfo = document.getElementById('frameInfo');
+const segList = document.getElementById('segList');
+const playBtn = document.getElementById('playBtn');
+
+for (const f of FILES) {
+  const opt = document.createElement('option');
+  opt.value = f;
+  opt.textContent = f + '.png';
+  fileSelect.appendChild(opt);
+}
+for (let r = 0; r < ROWS; r++) {
+  const opt = document.createElement('option');
+  opt.value = r;
+  opt.textContent = 'Rad ' + r;
+  rowSelect.appendChild(opt);
+}
+for (const seg of SEGMENTS) {
+  const btn = document.createElement('button');
+  btn.className = 'segBtn';
+  btn.textContent = `${seg.name}  (kol ${seg.start}-${seg.start + seg.len - 1})`;
+  btn.addEventListener('click', () => {
+    state.col = seg.start;
+    state.segFilter = seg;
+    highlightSeg(btn);
+    update();
+  });
+  seg._btn = btn;
+  segList.appendChild(btn);
+}
+function highlightSeg(activeBtn) {
+  for (const b of segList.querySelectorAll('.segBtn')) b.classList.toggle('active', b === activeBtn);
+}
+
+const state = { file: FILES[0], row: 0, col: 0, zoom: 0.35, fps: 8, playing: false, segFilter: null };
+
+function sheetSrc() {
+  return `../public/isometric_hero/${state.file}.png`;
+}
+
+function layout() {
+  const w = COLS * FRAME * state.zoom;
+  const h = ROWS * FRAME * state.zoom;
+  sheetImg.style.width = w + 'px';
+  sheetImg.style.height = h + 'px';
+  gridCanvas.width = w;
+  gridCanvas.height = h;
+  gridCanvas.style.width = w + 'px';
+  gridCanvas.style.height = h + 'px';
+}
+
+function drawGrid() {
+  const ctx = gridCanvas.getContext('2d');
+  const cell = FRAME * state.zoom;
+  ctx.clearRect(0, 0, gridCanvas.width, gridCanvas.height);
+  ctx.strokeStyle = 'rgba(255,0,255,0.5)';
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) {
+    ctx.beginPath();
+    ctx.moveTo(c * cell + 0.5, 0);
+    ctx.lineTo(c * cell + 0.5, ROWS * cell);
+    ctx.stroke();
+  }
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath();
+    ctx.moveTo(0, r * cell + 0.5);
+    ctx.lineTo(COLS * cell, r * cell + 0.5);
+    ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(255,255,0,0.9)';
+  ctx.font = `${Math.max(8, Math.round(10 * Math.max(state.zoom, 0.3)))}px monospace`;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const idx = r * COLS + c;
+      ctx.fillText(String(idx), c * cell + 2, r * cell + 10);
+    }
+  }
+  // segment boundary markers (top edge)
+  ctx.fillStyle = 'rgba(120,200,255,0.9)';
+  ctx.font = `${Math.max(8, Math.round(9 * Math.max(state.zoom, 0.3)))}px monospace`;
+  for (const seg of SEGMENTS) {
+    ctx.strokeStyle = 'rgba(120,200,255,0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(seg.start * cell, 0);
+    ctx.lineTo(seg.start * cell, ROWS * cell);
+    ctx.stroke();
+    ctx.fillText(seg.name, seg.start * cell + 2, ROWS * cell - 4);
+  }
+  // highlight current frame
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(state.col * cell + 1, state.row * cell + 1, cell - 2, cell - 2);
+}
+
+function updatePreview() {
+  const scale = 300 / FRAME;
+  preview.style.backgroundImage = `url(${sheetSrc()})`;
+  preview.style.backgroundSize = `${COLS * FRAME * scale}px ${ROWS * FRAME * scale}px`;
+  preview.style.backgroundPosition = `-${state.col * FRAME * scale}px -${state.row * FRAME * scale}px`;
+
+  const idx = state.row * COLS + state.col;
+  const seg = SEGMENTS.find((s) => state.col >= s.start && state.col < s.start + s.len);
+  const segFrame = seg ? state.col - seg.start : '-';
+  frameInfo.innerHTML = `
+    <b>Fil:</b> ${state.file}.png<br/>
+    <b>Rad (riktning):</b> ${state.row}<br/>
+    <b>Kolumn:</b> ${state.col}<br/>
+    <b>Absolut index:</b> ${idx}<br/>
+    <b>Segment:</b> ${seg ? seg.name + ` (frame ${segFrame}/${seg.len - 1})` : 'okänt'}
+  `;
+}
+
+function update() {
+  sheetImg.src = sheetSrc();
+  rowSelect.value = state.row;
+  layout();
+  drawGrid();
+  updatePreview();
+}
+
+fileSelect.addEventListener('change', () => { state.file = fileSelect.value; update(); });
+rowSelect.addEventListener('change', () => { state.row = Number(rowSelect.value); update(); });
+zoomInput.addEventListener('input', () => {
+  state.zoom = Number(zoomInput.value);
+  zoomVal.textContent = Math.round(state.zoom * 100) + '%';
+  update();
+});
+fpsInput.addEventListener('input', () => {
+  state.fps = Number(fpsInput.value);
+  fpsVal.textContent = state.fps + ' fps';
+});
+zoomVal.textContent = Math.round(state.zoom * 100) + '%';
+fpsVal.textContent = state.fps + ' fps';
+
+document.getElementById('prevBtn').addEventListener('click', () => stepFrame(-1));
+document.getElementById('nextBtn').addEventListener('click', () => stepFrame(1));
+
+function stepFrame(dir) {
+  const seg = state.segFilter;
+  if (seg) {
+    let f = state.col - seg.start + dir;
+    f = ((f % seg.len) + seg.len) % seg.len;
+    state.col = seg.start + f;
+  } else {
+    state.col = ((state.col + dir) % COLS + COLS) % COLS;
+  }
+  update();
+}
+function stepRow(dir) {
+  state.row = ((state.row + dir) % ROWS + ROWS) % ROWS;
+  update();
+}
+
+let playTimer = null;
+playBtn.addEventListener('click', () => {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? '⏸ Pause' : '▶ Play';
+  playBtn.classList.toggle('active', state.playing);
+  if (state.playing) tick();
+  else if (playTimer) clearTimeout(playTimer);
+});
+function tick() {
+  if (!state.playing) return;
+  stepFrame(1);
+  playTimer = setTimeout(tick, 1000 / state.fps);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft') stepFrame(-1);
+  else if (e.key === 'ArrowRight') stepFrame(1);
+  else if (e.key === 'ArrowUp') stepRow(-1);
+  else if (e.key === 'ArrowDown') stepRow(1);
+  else return;
+  e.preventDefault();
+});
+
+update();
+</script>
+</body>
+</html>
