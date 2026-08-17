@@ -3673,6 +3673,14 @@ export function render(ctx: CanvasRenderingContext2D, game: Game, view: View, dt
 
 // --- title & pause -----------------------------------------------------
 
+// The wordmark on public/svartfrost-logo.png is a 1024x1024 canvas with a
+// lot of transparent margin; these are its real ink bounds (measured once
+// via getImageData alpha-bounds scan), so we can crop straight to the glyph
+// shapes instead of drawing a mostly-empty square.
+const LOGO_SRC = { x: 40, y: 239, w: 947, h: 489 };
+const logoImg = new Image();
+logoImg.src = '/svartfrost-logo.png';
+
 function drawTitle(ctx: CanvasRenderingContext2D, game: Game, view: View, dt: number): void {
   const { w, h } = view;
   const t = performance.now() / 1000;
@@ -3686,14 +3694,44 @@ function drawTitle(ctx: CanvasRenderingContext2D, game: Game, view: View, dt: nu
   }
 
   ctx.textAlign = 'center';
-  if ('letterSpacing' in ctx) ctx.letterSpacing = '10px';
-  ctx.font = `bold 76px ${FONT_GOTHIC}`;
-  ctx.fillStyle = `rgba(215,221,229,${0.85 + 0.1 * Math.sin(t * 1.2)})`;
-  ctx.fillText('SVARTFROST', w / 2, h * 0.32);
-  if ('letterSpacing' in ctx) ctx.letterSpacing = '3px';
+  let subtitleY: number;
+  if (logoImg.complete && logoImg.naturalWidth > 0) {
+    let logoW = Math.min(680, Math.max(320, w * 0.5));
+    let logoH = logoW * (LOGO_SRC.h / LOGO_SRC.w);
+    const logoHCap = h * 0.3;
+    if (logoH > logoHCap) {
+      logoH = logoHCap;
+      logoW = logoH * (LOGO_SRC.w / LOGO_SRC.h);
+    }
+    const logoTop = h * 0.08;
+    ctx.globalAlpha = 0.85 + 0.1 * Math.sin(t * 1.2);
+    // The rest of the frame runs nearest-neighbor (see render()'s top) for
+    // the chunky photo-texture look; that turns this high-res logo blocky
+    // when it's downscaled, so smooth just this one blit.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(
+      logoImg,
+      LOGO_SRC.x, LOGO_SRC.y, LOGO_SRC.w, LOGO_SRC.h,
+      w / 2 - logoW / 2, logoTop, logoW, logoH,
+    );
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalAlpha = 1;
+    // Tuck the subtitle up into the lower, sparser part of the wordmark's
+    // own crop (its icicle drips leave that band mostly empty) instead of
+    // trailing a big gap below the whole glyph height.
+    subtitleY = logoTop + logoH * 0.9;
+  } else {
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '10px';
+    ctx.font = `bold 76px ${FONT_GOTHIC}`;
+    ctx.fillStyle = `rgba(215,221,229,${0.85 + 0.1 * Math.sin(t * 1.2)})`;
+    ctx.fillText('SVARTFROST', w / 2, h * 0.32);
+    if ('letterSpacing' in ctx) ctx.letterSpacing = '3px';
+    subtitleY = h * 0.32 + 46;
+  }
   ctx.font = `22px ${FONT_GOTHIC}`;
   ctx.fillStyle = 'rgba(160,168,178,0.75)';
-  ctx.fillText('the frost takes all', w / 2, h * 0.32 + 46);
+  ctx.fillText('the frost takes all', w / 2, subtitleY);
   if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
 
   const continueLabel = game.savedRun ? `Continue — Depth ${roman(game.savedRun.depth)}` : null;
